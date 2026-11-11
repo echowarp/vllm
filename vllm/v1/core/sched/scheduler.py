@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -205,6 +206,14 @@ class Scheduler(SchedulerInterface):
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
+
+        # EXL3_SCHED_LENCAP (default on; 0 = upstream): a request that can never be scheduled again
+        # (alone in `running` and still out of KV blocks, or clamped to zero new tokens at
+        # max_model_len) is finished as length-capped in update_from_output instead of preempting
+        # itself and re-prefilling forever.
+        self.lencap = os.environ.get("EXL3_SCHED_LENCAP", "1") != "0"
+        self.lencap_req_ids: set[str] = set()
+        self._lencap_wait_since: dict[str, float] = {}
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -540,12 +549,23 @@ class Scheduler(SchedulerInterface):
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
 
-            if self.need_mamba_block_aligned_split:
+            if self.need_mamba_block_aligned_split and num_new_tokens > 0:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
 
-            if num_new_tokens == 0:
+            if (
+                self.lencap
+                and num_new_tokens <= 0
+                and request.num_output_placeholders == 0
+                and request.num_computed_tokens + self.num_sampled_tokens_per_step
+                >= self.max_model_len
+            ):
+                self._lencap(request, "reached max_model_len")
+                req_index += 1
+                continue
+
+            if num_new_tokens <= 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -577,6 +597,24 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    if (
+                        self.lencap
+                        and len(self.running) == 1
+                        and self.running[0] is request
+                        and not any(
+                            r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                            for r in self.requests.values()
+                        )
+                    ):
+                        # Alone in `running`. If blocks are still held elsewhere (finished
+                        # requests whose KV-offload stores are in flight free them shortly),
+                        # wait (up to 30 s) instead of capping a request that would fit.
+                        # Otherwise it will never fit, even after a preemption and
+                        # re-prefill: hand it back as length-capped.
+                        if self._lencap_should_wait(request):
+                            break
+                        self._lencap(request, "does not fit in the KV cache")
+                        break
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -616,6 +654,8 @@ class Scheduler(SchedulerInterface):
                 break
 
             # Schedule the request.
+            if self._lencap_wait_since:
+                self._lencap_wait_since.pop(request.request_id, None)
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
@@ -1213,6 +1253,46 @@ class Scheduler(SchedulerInterface):
             skip.clear()
 
         return new_block_ids_to_zero or None
+
+    def _lencap_should_wait(self, request: Request) -> bool:
+        pool = self.kv_cache_manager.block_pool
+        try:
+            held = sum(
+                sum(1 for b in m.req_to_blocks.get(request.request_id, ()) if not b.is_null)
+                for m in self.kv_cache_manager.coordinator.single_type_managers
+            )
+        except Exception:
+            return False
+        others = (pool.num_gpu_blocks - 1) - pool.get_num_free_blocks() - held
+        if others <= 0:
+            self._lencap_wait_since.pop(request.request_id, None)
+            return False
+        t0 = self._lencap_wait_since.setdefault(request.request_id, time.monotonic())
+        if time.monotonic() - t0 < 30.0:
+            return True
+        logger.warning("Request %s waited 30 s for %d blocks held outside running requests",
+                       request.request_id, others)
+        return False
+
+    def _lencap(self, request: Request, why: str) -> None:
+        self._lencap_wait_since.pop(request.request_id, None)
+        if request.request_id not in self.lencap_req_ids:
+            pool = self.kv_cache_manager.block_pool
+            try:
+                held = [
+                    sum(1 for b in m.req_to_blocks.get(request.request_id, ()) if not b.is_null)
+                    for m in self.kv_cache_manager.coordinator.single_type_managers
+                ]
+            except Exception as e:  # diagnostics only
+                held = repr(e)
+            logger.warning(
+                "Request %s %s (%d tokens, %d computed, max_model_len %d, free blocks %d/%d, "
+                "held per group %s): finishing it as length-capped",
+                request.request_id, why, request.num_tokens,
+                request.num_computed_tokens, self.max_model_len,
+                pool.get_num_free_blocks(), pool.num_gpu_blocks, held,
+            )
+        self.lencap_req_ids.add(request.request_id)
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -1867,6 +1947,21 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+
+        if self.lencap_req_ids:
+            lencap_ids, self.lencap_req_ids = self.lencap_req_ids, set()
+            for request in self.finish_requests(
+                lencap_ids, RequestStatus.FINISHED_LENGTH_CAPPED
+            ):
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
