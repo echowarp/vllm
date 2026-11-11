@@ -285,8 +285,120 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
+class DynamicPoolPinner:
+    """Dynamic pinning for a broker-managed shared pool: the broker can PARK slot runs (evict them, hole-punch
+    their memory and lower the huge-page reservation) and later re-allocate them. Pinned pages cannot be punched, and a
+    page re-allocated under a stale cudaHostRegister mapping would be read by the GPU from the OLD physical page, so
+    this worker registers the pool PER SLOT (one cudaHostRegister per broker slot), announces itself to the broker with
+    a PoolAck and then follows the broker's parked set: unregister parked slots, re-register slots that came back, and
+    ack each generation. The broker punches only after every announced client acked. Needs the llmt_kv client with
+    pool_state/pool_ack (broker >= dynamic-pool build); without it the worker falls back to the whole-pool registration
+    and never acks (the broker then parks nothing that needs acks: a mixed deployment stays safe only while the
+    broker runs without autonomous culling)."""
+
+    POLL_S = 1.0
+
+    def __init__(self, region: SharedOffloadRegion):
+        import threading
+        self.region = region
+        self.base = region._base.data_ptr()
+        self.stride = int(region._row_stride)
+        self.n = int(region.num_blocks)
+        self.registered: set[int] = set()
+        self.parked: set[int] = set()
+        self.gen = -1
+        self.cudart = torch.cuda.cudart()
+        self.client = None
+        self.stop = threading.Event()
+        t0 = time.monotonic()
+        fails = 0
+        for i in range(self.n):
+            fails += 0 if self._register(i) else 1
+        logger.info("DYN-PIN: registered %d of %d slots (%.1f MB each) in %.1f s%s", self.n - fails, self.n,
+                    self.stride / 1e6, time.monotonic() - t0, f", {fails} failed" if fails else "")
+        self.thread = threading.Thread(target=self._run, name="dyn-pin", daemon=True)
+        self.thread.start()
+
+    def _register(self, i: int) -> bool:
+        r = self.cudart.cudaHostRegister(self.base + i * self.stride, self.stride, 0)
+        if r.value != 0:
+            logger.warning("DYN-PIN: cudaHostRegister slot %d failed (code %d)", i, r.value)
+            return False
+        self.registered.add(i)
+        return True
+
+    def _unregister(self, i: int) -> None:
+        if i in self.registered:
+            r = self.cudart.cudaHostUnregister(self.base + i * self.stride)
+            if r.value != 0:
+                logger.warning("DYN-PIN: cudaHostUnregister slot %d failed (code %d)", i, r.value)
+            self.registered.discard(i)
+
+    def _connect(self):
+        try:
+            import llmt_kv
+        except ImportError:
+            return None
+        sock = os.environ.get("LLMT_KV_SOCKET", "/run/llmt-kv/broker.sock")
+        try:
+            c = llmt_kv.Client(socket=sock, engine_id=int(os.environ.get("LLMT_KV_ENGINE_ID", "0")),
+                               name=os.environ.get("LLMT_KV_PIN_NAME", "pin-worker"), timeout_ms=50.0)
+            if not hasattr(c, "pool_state"):
+                logger.warning("DYN-PIN: llmt_kv client without pool_state: not following the broker's parked set")
+                return None
+            return c
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DYN-PIN: no broker on %s (%s); retrying", sock, e)
+            return None
+
+    def _run(self) -> None:
+        announced = False
+        while not self.stop.is_set():
+            try:
+                if self.client is None:
+                    self.client = self._connect()
+                    announced = False
+                    if self.client is None:
+                        self.stop.wait(5.0)
+                        continue
+                gen, runs = self.client.pool_state()
+                if not announced or gen != self.gen:
+                    parked = {j for start, n in runs for j in range(start, start + n)}
+                    for i in sorted(parked - self.parked):
+                        self._unregister(i)
+                    for i in sorted(self.parked - parked):
+                        if i < self.n:
+                            self._register(i)
+                    if parked != self.parked or not announced:
+                        logger.info("DYN-PIN: broker generation %d: %d slots parked (unregistered), %d registered",
+                                    gen, len(parked), len(self.registered))
+                    self.parked = parked
+                    self.gen = gen
+                    self.client.pool_ack(gen)
+                    announced = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning("DYN-PIN: broker call failed (%s); reconnecting", e)
+                self.client = None
+            self.stop.wait(self.POLL_S)
+
+    def close(self) -> None:
+        self.stop.set()
+        for i in sorted(self.registered):
+            self._unregister(i)
+
+
+DYN_PIN = os.environ.get("EXL3_DYN_PIN", "1") == "1"
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
-    """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
+    """Register the mmap as CUDA pinned memory via cudaHostRegister (per slot with DYN_PIN, see DynamicPoolPinner)."""
+    if DYN_PIN and current_platform.is_cuda_alike() and getattr(region, "_row_stride", 0) and getattr(region, "num_blocks", 0):
+        try:
+            region._llmt_pinner = DynamicPoolPinner(region)
+            region.is_pinned = False      # the pinner owns the registrations (cleanup goes through it)
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DYN-PIN: per-slot registration failed (%s); whole-pool registration instead", e)
     if not current_platform.is_cuda_alike():
         logger.info(
             "Skipping mmap host registration on %s; cudaHostRegister is only "
@@ -678,6 +790,10 @@ class SingleDirectionOffloadingHandler:
         self.src_tensors.clear()
         self.dst_tensors.clear()
         if self._mmap_region is not None:
+            pinner = getattr(self._mmap_region, "_llmt_pinner", None)
+            if pinner is not None:
+                pinner.close()
+                self._mmap_region._llmt_pinner = None
             self._mmap_region.cleanup()
             self._mmap_region = None
 
