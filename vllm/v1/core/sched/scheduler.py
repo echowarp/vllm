@@ -71,6 +71,7 @@ logger = init_logger(__name__)
 # EXL3_HYBRID_CONN_LOOKUP=upstream restores upstream's per-group prefix lookup for hybrid (Mamba) models with a KV
 # connector; see schedule().
 _HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
+_DSK_DECODE_COUNT = os.environ.get("EXL3_DYN_SD_DECODE_COUNT", "0") == "1"  # DSK (see dynamic SD in schedule())
 # MIXED-PROPOSE (see schedule()): draft depth PROPOSED for decode rows when the next step carries a prefill chunk: ""
 # off, "max", or a depth. Distinct from EXL3_SCHED_MIXED_K (caps the drafts SCHEDULED in such a step).
 _MIXED_PROPOSE = os.environ.get("EXL3_SCHED_MIXED_PROPOSE", "")
@@ -1360,8 +1361,21 @@ class Scheduler(SchedulerInterface):
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+            # DSK: key the depth table on the requests DECODING this step (prompt fully computed), not on
+            # every scheduled request. Upstream counts prefilling requests too, which cuts decoders' depth in
+            # mixed steps (2 decoders + 1 prefill -> k=3). EXL3_DYN_SD_DECODE_COUNT=0 (default) keeps
+            # upstream's keying; any error falls back to it (never breaks scheduling).
+            n_key = len(num_scheduled_tokens)
+            if _DSK_DECODE_COUNT:
+                try:
+                    n_key = max(1, sum(1 for rid in num_scheduled_tokens
+                                       if (rq := self.requests.get(rid)) is not None
+                                       and rq.num_computed_tokens >= rq.num_prompt_tokens))
+                except Exception as e:
+                    logger.warning("DSK: decode count failed, upstream keying: %r", e)
+                    n_key = len(num_scheduled_tokens)
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
+                min(n_key, len(self.dynamic_sd_lookup) - 1)
             ]
         # MIXED-PROPOSE: when the NEXT step will carry a prefill chunk (a running request still has prompt
         # tokens to compute, or requests wait), the decode rows ride along a prefill-bound step (~1.2 s) where
