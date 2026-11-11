@@ -1270,6 +1270,10 @@ class OffloadingConnectorScheduler:
             self._connector_stats.aggregate(transfer_stats)
 
         for job_id, count in meta.completed_jobs.items():
+            # The worker adds 1 << 20 when a store's RAM copy failed the NaN scan
+            nan_failed = count >= (1 << 20)
+            if nan_failed:
+                count -= 1 << 20
             assert count > 0
             if job_id < self._stale_job_threshold:
                 logger.debug(
@@ -1279,6 +1283,8 @@ class OffloadingConnectorScheduler:
                 )
                 continue
             job_status = self._jobs[job_id]
+            if nan_failed:
+                self.__dict__.setdefault("_nan_failed_jobs", set()).add(job_id)
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue
@@ -1286,7 +1292,14 @@ class OffloadingConnectorScheduler:
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                ok = job_id not in self.__dict__.get("_nan_failed_jobs", ())
+                if not ok:
+                    self._nan_failed_jobs.discard(job_id)
+                if not ok:
+                    logger.warning(
+                        "OFFLOAD-NAN: request %s store job %d failed the NaN scan: %d chunk(s) dropped from the RAM tier",
+                        job_status.req_id, job_id, len(job_status.keys))
+                self.manager.complete_store(job_status.keys, req_status.req_context, success=ok)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:

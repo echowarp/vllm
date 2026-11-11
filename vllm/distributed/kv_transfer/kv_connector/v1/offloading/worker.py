@@ -3,6 +3,8 @@
 from collections import defaultdict
 from dataclasses import replace
 
+import os
+
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -32,6 +34,10 @@ from vllm.v1.kv_offload.base import (
 )
 
 logger = init_logger(__name__)
+_NC_CONV_ROWS = int(os.environ.get("EXL3_KV_NANCHECK_CONV_ROWS", "3"))  # conv-state rows that hold real state
+
+# RAM-tier NaN scan: added to a store job's completion count when its RAM copy failed the NaN scan
+_NANCHK_FAIL = 1 << 20
 
 
 class OffloadingConnectorWorker:
@@ -228,6 +234,53 @@ class OffloadingConnectorWorker:
             tensors=block_tensors,
             group_data_refs=group_data_refs,
         )
+        # RAM-tier NaN scan: dtype segments of one page per group / data ref, for the store scan.
+        try:
+            from vllm.v1.kv_offload.cpu import gpu_worker as _ncw
+
+            group_segs = []
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                gspec = kv_cache_group.kv_cache_spec
+                per_layer = gspec.kv_cache_specs if isinstance(gspec, UniformTypeKVCacheSpecs) else {}
+                refs_segs = []
+                for layer_name in kv_cache_group.layer_names:
+                    lspec = per_layer.get(layer_name, gspec)
+                    for ref in block_data_refs[layer_name]:
+                        if isinstance(lspec, AttentionSpec):
+                            # quantized KV (int8_per_token_head etc.): the page holds int8 codes (+ inline f32 scales)
+                            # whatever the tensor dtype says -> not scanned (int8 has no NaN; 0x7F7F reads as fp16 NaN)
+                            if getattr(getattr(lspec, "kv_quant_mode", None), "name", "NONE") != "NONE":
+                                refs_segs.append([])
+                            else:
+                                refs_segs.append([(0, ref.page_size_bytes, kv_caches[layer_name].dtype)])
+                        elif isinstance(lspec, MambaSpec):
+                            segs = []
+                            for si, st in enumerate(kv_caches[layer_name]):
+                                off = st.storage_offset() * st.element_size()
+                                n = st[0].numel() * st.element_size()
+                                # conv state [blocks, conv rows, dim]: only the first EXL3_KV_NANCHECK_CONV_ROWS rows (the
+                                # kernel-1 = 3 history rows) are state; the extra rows are the per-draft spec window, which
+                                # GDN recompute never writes (stale memory: 0x7F.. int8 KV leftovers read as NaN)
+                                if si == 0 and st.dim() == 3 and st.shape[1] > _NC_CONV_ROWS:
+                                    n = _NC_CONV_ROWS * st.shape[2] * st.element_size()
+                                if off + n <= ref.page_size_bytes:
+                                    segs.append((off, n, st.dtype))
+                            refs_segs.append(segs)
+                        else:
+                            refs_segs.append([])
+                group_segs.append(refs_segs)
+            _ncw.set_layout(group_segs)
+            for gi, (kv_cache_group, refs_segs) in enumerate(zip(kv_cache_config.kv_cache_groups, group_segs)):
+                gspec = kv_cache_group.kv_cache_spec
+                ln0 = kv_cache_group.layer_names[0]
+                shp = [tuple(t.shape) for t in kv_caches[ln0]] if isinstance(kv_caches[ln0], (list, tuple)) else tuple(kv_caches[ln0].shape)
+                logger.info("KV-NANCHECK layout: group %d %s (quant %s), %d layers, %d refs, tensor shapes %s, first ref segments %s",
+                            gi, type(gspec).__name__, getattr(gspec, "kv_quant_mode", None),
+                            len(kv_cache_group.layer_names), len(refs_segs), shp, refs_segs[0] if refs_segs else None)
+            logger.info("KV-NANCHECK layout: %s", [
+                sorted({(str(d), n) for r in g for (_, n, d) in r}) for g in group_segs])
+        except Exception as e:
+            logger.warning("KV-NANCHECK: no page layout (%r); stores are not scanned", e)
 
         self._init_worker(canonical_kv_caches)
 
@@ -340,8 +393,9 @@ class OffloadingConnectorWorker:
         for transfer_result in self.worker.get_finished():
             # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
+            # A store can fail its NaN scan; loads still never fail.
+            assert transfer_result.success or not is_load
             if (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
@@ -356,6 +410,9 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
+            if not transfer_result.success:
+                # flag the completion; the scheduler connector decodes it and frees the chunks
+                self._connector_worker_meta.completed_jobs[job_id] += _NANCHK_FAIL
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
