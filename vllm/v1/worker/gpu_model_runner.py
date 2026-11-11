@@ -297,6 +297,8 @@ _TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llm
 # EXL3_ALIGN_NOSYNC=1 enables it.
 _ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
 _RC_PINNED = os.environ.get("EXL3_RC_PINNED", "0") == "1"  # RC-PINNED (see _llmt_gdn_rc)
+# SPEC-STOP: drop speculative tokens sampled AFTER a stop token on the GPU (see _llmt_stop_truncate)
+_SPEC_STOP = os.environ.get("EXL3_SPEC_STOP_TRUNC", "0") == "1"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -3822,6 +3824,8 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
+        if _SPEC_STOP:
+            self._llmt_stop_truncate(sampler_output.sampled_token_ids)
         return sampler_output
 
     def _bookkeeping_sync(
@@ -8043,6 +8047,71 @@ class GPUModelRunner(
                 return False
         st[1] += 1
         return True
+
+    def _llmt_eos_ids(self) -> set:
+        ids = self.__dict__.get("_llmt_eos_set")
+        if ids is None:
+            ids = set()
+            try:
+                from vllm.transformers_utils.config import try_get_generation_config
+                gen_cfg = try_get_generation_config(self.model_config.model, self.model_config.trust_remote_code)
+                e = getattr(gen_cfg, "eos_token_id", None) if gen_cfg is not None else None
+                ids |= set(e if isinstance(e, (list, tuple)) else ([e] if e is not None else []))
+            except Exception:
+                pass
+            e = getattr(self.model_config.hf_text_config, "eos_token_id", None)
+            ids |= set(e if isinstance(e, (list, tuple)) else ([e] if e is not None else []))
+            ids = {int(x) for x in ids if x is not None}
+            self._llmt_eos_set = ids
+            logger.info("SPEC-STOP on: speculative tokens after a stop token are dropped on the GPU (eos ids %s)", sorted(ids))
+        return ids
+
+    def _llmt_stop_truncate(self, ids) -> None:
+        """SPEC-STOP. Upstream's rejection sampler keeps every accepted draft token, including the
+        ones AFTER a stop token; the scheduler truncates them later on the CPU. With async scheduling the next step has
+        then already run from the pre-truncation position, so (a) the GDN state moves past the real end of the request
+        (TAIL-HOLD case B refuses the hold: 30 of 44 real finishes in a production replay) and (b) the step computes
+        garbage positions. Mark the tokens after the first stop token (EOS ids unless ignore_eos, plus the request's
+        stop_token_ids) as INVALID (-1) in place, right after sampling, so every consumer (accepted counts, drafter,
+        async position correction, scheduler) sees the truncated run. Same tokens as the scheduler would keep.
+        Requests with min_tokens > 0 are left to the scheduler (it must ignore early stops). Per-batch stop table cached
+        by request-id order (pinned, async H2D) so steady-state steps add two small GPU ops and no sync."""
+        if ids is None or ids.dim() != 2 or ids.shape[1] <= 1:
+            return
+        n = ids.shape[0]
+        key = tuple(self.input_batch.req_ids[:n])
+        cache = self.__dict__.setdefault("_llmt_stop_cache", {})
+        ent = cache.get("ent")
+        if ent is None or ent[0] != key:
+            eos = self._llmt_eos_ids()
+            rows, S = [], 1
+            for rid in key:
+                st = self.requests.get(rid)
+                sp = getattr(st, "sampling_params", None)
+                sset = set()
+                if sp is not None and not getattr(sp, "min_tokens", 0):
+                    if not getattr(sp, "ignore_eos", False):
+                        sset |= eos
+                    sset |= set(getattr(sp, "stop_token_ids", None) or ())
+                r = sorted(sset)
+                rows.append(r)
+                S = max(S, len(r))
+            if not any(rows):
+                ent = (key, None, None)
+            else:
+                t = torch.full((n, S), -2, dtype=ids.dtype)
+                for i, r in enumerate(rows):
+                    if r:
+                        t[i, : len(r)] = torch.tensor(r, dtype=ids.dtype)
+                t = t.pin_memory()
+                ent = (key, t, t.to(ids.device, non_blocking=True))   # keep the pinned source alive with the entry
+            cache["ent"] = ent
+        stops = ent[2]
+        if stops is None:
+            return
+        is_stop = (ids.unsqueeze(-1) == stops.unsqueeze(1)).any(-1)          # [n, 1 + k]
+        after = (is_stop.int().cumsum(1) - is_stop.int()) > 0                   # strictly after the first stop token
+        ids.masked_fill_(after, -1)
 
     def initialize_kv_cache(
         self,
