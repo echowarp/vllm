@@ -71,6 +71,53 @@ logger = init_logger(__name__)
 # connector; see schedule().
 _HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
 
+# EAGLE-KEEP: with EAGLE/MTP, vLLM drops the last matched block of every prefix hit (the drafter's KV entry at the
+# block's last position needs the next token, so it may be missing) and saves the Mamba/GDN state one block early to
+# match. With large blocks (1,664 tokens in a Qwen3.8-27B deployment) that re-prefills a whole block per agent turn:
+# 33-43% of all computed prefill in that deployment's agent traffic.
+# EXL3_EAGLE_KEEP=1: keep the full hit when the hit's last draft block is known complete (its owner processed the token
+# after it, so the drafter wrote that entry; tracked per physical block + content hash); else vLLM's drop. Outputs stay
+# exact either way (the target verifies every token; only draft KV is concerned).
+# EXL3_EAGLE_KEEP=2: always keep the full hit, no tracking. A missing drafter entry is then zeros (KV allocated with
+# torch.zeros, int8 scales filled with 1.0) or stale finite data from an earlier owner: at most one slightly wrong
+# position in the drafter's context; drafts only.
+_EAGLE_KEEP_MODE = os.environ.get("EXL3_EAGLE_KEEP", "0")
+_EAGLE_KEEP = _EAGLE_KEEP_MODE in ("1", "2")
+_EK_DONE: dict = {}          # draft-group physical block_id -> block_hash at completion
+_EK_STAT = {"hits": 0, "kept": 0, "fallback": 0, "saved_tokens": 0}
+if _EAGLE_KEEP:
+    _ek_orig_flch = HybridKVCacheCoordinator.find_longest_cache_hit
+
+    def _ek_flch(self, block_hashes, max_cache_hit_length):
+        groups = self.attention_groups
+        eg = [i for i, g in enumerate(groups) if g.use_eagle]
+        if not eg:
+            return _ek_orig_flch(self, block_hashes, max_cache_hit_length)
+        self.attention_groups = [g._replace(use_eagle=False) for g in groups]
+        try:
+            res = _ek_orig_flch(self, block_hashes, max_cache_hit_length)
+        finally:
+            self.attention_groups = groups
+        blocks, L, unc = res
+        if L <= 0:
+            return res
+        _EK_STAT["hits"] += 1
+        if _EAGLE_KEEP_MODE == "2":
+            _EK_STAT["kept"] += 1
+            return res
+        gid = groups[eg[0]].group_ids[0]
+        hb = blocks[gid] if gid < len(blocks) else []
+        last = hb[-1] if hb else None
+        if last is not None and last.block_hash is not None and _EK_DONE.get(last.block_id) == last.block_hash:
+            _EK_STAT["kept"] += 1
+            res2 = _ek_orig_flch(self, block_hashes, max_cache_hit_length)
+            _EK_STAT["saved_tokens"] += max(0, L - res2[1])
+            return res
+        _EK_STAT["fallback"] += 1
+        return _ek_orig_flch(self, block_hashes, max_cache_hit_length)
+
+    HybridKVCacheCoordinator.find_longest_cache_hit = _ek_flch
+
 
 # GPU-EVICT-ORDER: EXL3_GPU_EVICT_ORDER=chain returns a finished hybrid request's blocks to the free queue
 # position-interleaved across all KV groups (block i of every group, i ascending) instead of group by group.
@@ -450,7 +497,7 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.use_eagle and not _EAGLE_KEEP:   # EAGLE-KEEP: state at the last full block boundary
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -1515,6 +1562,42 @@ class Scheduler(SchedulerInterface):
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
 
+    def _ek_track(self, scheduler_output) -> None:
+        """EAGLE-KEEP: mark draft-group blocks whose next token this request has processed (their drafter entry at the
+        block's last position is then written); clear marks on the request's not-yet-complete blocks."""
+        coord = getattr(self.kv_cache_manager, "coordinator", None)
+        groups = getattr(coord, "attention_groups", None)
+        if not groups:
+            return
+        eg = [g for g in groups if g.use_eagle]
+        if not eg:
+            return
+        gid = eg[0].group_ids[0]
+        mgr = coord.single_type_managers[gid]
+        bs = mgr.block_size
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            blks = mgr.req_to_blocks.get(req_id) if request is not None else None
+            if not blks:
+                continue
+            known = min(request.num_computed_tokens, request.num_tokens)
+            done_upto = getattr(request, "_ek_upto", 0)
+            n_done = min(len(blks), (known - 1) // bs) if known > 0 else 0   # block i complete if known > (i+1)*bs
+            for i in range(done_upto, n_done):
+                b = blks[i]
+                if b.block_hash is None:
+                    n_done = i
+                    break
+                _EK_DONE[b.block_id] = b.block_hash
+            request._ek_upto = max(done_upto, n_done)
+            for b in blks[request._ek_upto:]:            # frontier blocks of this request: not complete (yet)
+                _EK_DONE.pop(b.block_id, None)
+        st = _EK_STAT
+        if st["hits"] and st["hits"] % 500 == 0 and st.get("_logged") != st["hits"]:
+            st["_logged"] = st["hits"]
+            logger.info("EAGLE-KEEP: %d hits, kept the last block on %d, fallback %d, ~%d prefill tokens saved",
+                        st["hits"], st["kept"], st["fallback"], st["saved_tokens"])
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
@@ -1525,6 +1608,11 @@ class Scheduler(SchedulerInterface):
         #    scheduling step.
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
+        if _EAGLE_KEEP_MODE == "1" or (_EAGLE_KEEP and _EK_STAT["hits"] % 500 == 0):
+            try:
+                self._ek_track(scheduler_output)
+            except Exception as e:   # never break scheduling
+                logger.warning("EAGLE-KEEP: track failed: %r", e)
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
