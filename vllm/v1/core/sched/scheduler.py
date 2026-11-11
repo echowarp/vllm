@@ -198,6 +198,11 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
+        # NAN-PREEMPT: see _nan_preempt.
+        self._nan_preempt_on = os.environ.get("EXL3_NAN_PREEMPT", "1") != "0"
+        self._nan_preempt_max = int(os.environ.get("EXL3_NAN_PREEMPT_MAX", "2"))
+        logger.info("NAN-PREEMPT %s (max %d recomputes per request)",
+                    "on" if self._nan_preempt_on else "off", self._nan_preempt_max)
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -785,6 +790,7 @@ class Scheduler(SchedulerInterface):
                         self.connector is not None
                         and self.has_mamba_layers
                         and _HYBRID_CONN_UPSTREAM
+                        and not request.skip_reading_prefix_cache  # NAN-PREEMPT recompute
                         and isinstance(
                             self.kv_cache_manager.coordinator,
                             HybridKVCacheCoordinator,
@@ -1380,6 +1386,65 @@ class Scheduler(SchedulerInterface):
             )
         self.lencap_req_ids.add(request.request_id)
 
+    def _nan_preempt(
+        self,
+        request: Request,
+        model_runner_output: ModelRunnerOutput,
+    ) -> bool:
+        """The model runner saw NaN/+inf logits for this request in the step just completed.
+
+        Instead of ending the request (the runner's fallback forces end-of-turn), discard this step's
+        tokens, drop the request's KV/Mamba state and its prefix-cache blocks, and put it back at the
+        head of the waiting queue so it is recomputed from its tokens and carries on. Mirrors
+        reset_prefix_cache(reset_running_requests=True) for one request, including the in-flight
+        async frame discard. Returns True when preempted (the caller skips the request for this
+        step) and False when giving up after EXL3_NAN_PREEMPT_MAX recomputes: the forced
+        end-of-turn then finishes it as before, and the "NAN-GUARD:" log line lets an external
+        watchdog act on the stubborn case only.
+        """
+        attempt = getattr(request, "_nan_preempts", 0) + 1
+        rows = (model_runner_output.num_nans_in_logits or {}).get(request.request_id, 0)
+        if attempt > self._nan_preempt_max:
+            logger.warning(
+                "NAN-GUARD: request %s hit NaN/inf logits again after %d recompute(s) at %d tokens; "
+                "giving up, finishing it with the forced end-of-turn",
+                request.request_id, attempt - 1, request.num_tokens,
+            )
+            return False
+        request._nan_preempts = attempt
+        evict: set[int] = set()
+        for group in self.kv_cache_manager.get_block_ids(request.request_id):
+            evict.update(group)
+        n_tokens, n_out, n_comp = request.num_tokens, request.num_output_tokens, request.num_computed_tokens
+        try:
+            self.running.remove(request)
+        except ValueError:
+            pass
+        self._preempt_request(request, time.monotonic())
+        # The freed blocks may hold the poisoned state: make sure no later prefix hit reuses them.
+        self.kv_cache_manager.evict_blocks(evict)
+        # Async scheduling: frames already in flight for this request are stale (see reset_prefix_cache).
+        # Frames still in flight for this request = steps scheduled after this one (at most one with
+        # the async batch queue of 2); num_in_flight_tokens was already reduced by this step. Not the
+        # placeholder count: that is tokens (1 + spec per step), and over-counting would discard real
+        # frames after the resume.
+        request.async_tokens_to_discard = 1 if request.num_in_flight_tokens > 0 else 0
+        request.num_output_placeholders = 0
+        request.num_nans_in_logits = 0
+        # The recompute must not reload a possibly poisoned prefix from the CPU tier (connector) or a
+        # shared GPU block: read no prefix cache for this request.
+        request.skip_reading_prefix_cache = True
+        # Resume as a fresh request in the model runner (full token ids are re-sent).
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        logger.warning(
+            "NAN-PREEMPT: request %s had %d NaN/inf logit row(s) at %d tokens (%d generated, %d computed); "
+            "step discarded, %d cached block(s) evicted, state freed, re-queued for recompute "
+            "(attempt %d/%d; recompute reads no prefix cache / CPU tier)",
+            request.request_id, rows, n_tokens, n_out, n_comp, len(evict), attempt,
+            self._nan_preempt_max,
+        )
+        return True
+
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
 
@@ -1829,6 +1894,8 @@ class Scheduler(SchedulerInterface):
                 # skip failed or rescheduled requests from KV load failure
                 continue
             if request is None or request.is_finished():
+                if num_nans_in_logits and num_nans_in_logits.get(req_id, 0) > 0:
+                    logger.warning("NAN-PREEMPT: NaN rows for %s but the request is already %s", req_id, "gone" if request is None else request.status)
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or in async scheduling).
@@ -1846,6 +1913,22 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            if num_nans_in_logits and num_nans_in_logits.get(req_id, 0) > 0 and not (
+                self._nan_preempt_on and request.status == RequestStatus.RUNNING and request.async_tokens_to_discard == 0
+            ):
+                logger.warning("NAN-PREEMPT: not preempting %s: on=%s status=%s discard=%d (finished=%s)", req_id,
+                               self._nan_preempt_on, request.status, request.async_tokens_to_discard, request.is_finished())
+            # NAN-PREEMPT: NaN/inf logits for this request in this step -> discard the step, drop its
+            # state and re-queue it (see _nan_preempt) instead of ending it.
+            if (
+                num_nans_in_logits
+                and self._nan_preempt_on
+                and num_nans_in_logits.get(req_id, 0) > 0
+                and request.status == RequestStatus.RUNNING
+                and request.async_tokens_to_discard == 0
+                and self._nan_preempt(request, model_runner_output)
+            ):
+                continue
             # Skip a stale frame still pending discard (async_tokens_to_discard
             # > 0): its pre-reset rejection count would underflow the counters.
             if (
