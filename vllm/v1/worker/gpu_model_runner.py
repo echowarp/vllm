@@ -253,6 +253,16 @@ logger = init_logger(__name__)
 _MAMBA_ACC_FIX = os.environ.get("EXL3_MAMBA_ACC_FIX", "1") == "1"  # MAMBA-ACC (see execute_model)
 _GDN_RC_ON = os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1"  # GDN-RECOMPUTE (see _llmt_gdn_rc)
 _TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llmt_tail_hold)
+# ALIGN-NOSYNC: with mamba_cache_mode="align" + async scheduling + spec decode, vLLM waits every step for the previous
+# step's accepted-token counts on the CPU (num_accepted_tokens_event) and applies the deferred spec corrections
+# (another wait) before preprocess_mamba, so the CPU prepares step n+1 only after step n has finished and the GPU idles
+# for the whole preparation (~2.6 ms of 18.4 ms per step at 1 stream on an RTX 5090). The CPU values only matter when
+# a request's GDN state crosses a block boundary. On a "quiet" step (same requests in the same rows as last step, all
+# speculative both steps, every request >= 3*(k+1) tokens away from a mamba block boundary) the counts are taken on
+# the GPU (copy of the postprocess output) instead, preprocess runs without corrections (it has nothing to copy) and
+# the corrections are applied after the launch, as in non-align async mode. Other steps keep the synchronous path.
+# EXL3_ALIGN_NOSYNC=1 enables it.
+_ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -2132,6 +2142,12 @@ class GPUModelRunner(
         needs_cpu_accepted_counts = self.num_accepted_tokens_event is not None and not (
             self.use_async_scheduling and self.cache_config.mamba_cache_mode != "align"
         )
+        if needs_cpu_accepted_counts and getattr(self, "_llmt_ns_quiet", False):
+            # ALIGN-NOSYNC: same rows as last step -> the CPU copy would equal the postprocess output
+            pp = self._get_mamba_bufs().postprocess_align
+            self.num_accepted_tokens.gpu[:num_reqs].copy_(pp.num_accepted_tokens_out[:num_reqs])
+            self.num_accepted_tokens.gpu[num_reqs:].fill_(1)
+            needs_cpu_accepted_counts = False
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.synchronize()
@@ -4301,6 +4317,7 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            self._llmt_ns_quiet = self._llmt_align_quiet(scheduler_output) if _ALIGN_NOSYNC else False
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -4375,13 +4392,18 @@ class GPUModelRunner(
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.
-                if deferred_state_corrections_fn:
+                _quiet = getattr(self, "_llmt_ns_quiet", False)
+                if deferred_state_corrections_fn and not _quiet:   # quiet: applied after the launch
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
                 if _GDN_RC_ON:
                     try:
                         self._llmt_gdn_rc(scheduler_output, mamba_bufs.preprocess)
+                        if _quiet:   # pending count = last step's accepted count, from the GPU (CPU copy not waited for)
+                            from exl3cuda.vllm_plugin import GDN_RC
+                            _n = self.input_batch.num_reqs
+                            GDN_RC["buf"]["npend"][:_n].copy_(self.num_accepted_tokens.gpu[:_n])
                     except Exception as _e:
                         logger.warning("GDN-RC: hook failed: %r", _e)
                 # MAMBA-ACC: num_accepted_tokens only means something for a request whose previous step was a
@@ -4425,10 +4447,11 @@ class GPUModelRunner(
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the
                 # correct initial state slot (init_token_idx = 0).
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
-                self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                if not _quiet:   # quiet: nothing was copied, the GPU counts are current; the CPU ones are not
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                    )
+                    self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
                 # Stage per-request inputs for the fused postprocess kernel
                 # only when that kernel will actually run. The kernel is
@@ -7916,6 +7939,38 @@ class GPUModelRunner(
             sh["flushed"][rid] = ok
         if (st["flushed"] + st["failed"]) % 500 < len(holds):
             logger.info("TAIL-HOLD: runner flushed %d, failed %d", st["flushed"], st["failed"])
+
+    def _llmt_align_quiet(self, scheduler_output) -> bool:
+        """ALIGN-NOSYNC: True if this step can skip the accepted-count wait (see _ALIGN_NOSYNC)."""
+        req_ids = list(self.input_batch.req_ids)
+        spec = scheduler_output.scheduled_spec_decode_tokens
+        prev_order = getattr(self, "_llmt_ns_order", None)
+        prev_spec = getattr(self, "_llmt_ns_spec", set())
+        self._llmt_ns_order, self._llmt_ns_spec = req_ids, set(spec.keys())
+        st = self.__dict__.setdefault("_llmt_ns_stats", [0, 0])
+        st[0] += 1
+        if st[0] % 2000 == 0:
+            logger.info("ALIGN-NOSYNC: %d of the last 2000 steps skipped the accepted-count wait", st[1])
+            st[1] = 0
+        if (not req_ids or req_ids != prev_order or self.cache_config.mamba_cache_mode != "align"
+                or not self.use_async_scheduling or self.num_accepted_tokens_event is None
+                or scheduler_output.scheduled_new_reqs or scheduler_output.finished_req_ids
+                or scheduler_output.scheduled_cached_reqs.resumed_req_ids):
+            return False
+        bufs = self._get_mamba_bufs()
+        if bufs.postprocess_align is None:
+            return False
+        bs = bufs.preprocess.mamba_spec.block_size
+        margin = 3 * (self.num_spec_tokens + 1)
+        for rid in req_ids:
+            if rid not in spec or rid not in prev_spec:
+                return False
+            c = self.requests[rid].num_computed_tokens
+            lo, hi = c - margin, c + scheduler_output.num_scheduled_tokens.get(rid, 0) + margin
+            if lo < 0 or lo // bs != hi // bs:
+                return False
+        st[1] += 1
+        return True
 
     def initialize_kv_cache(
         self,
