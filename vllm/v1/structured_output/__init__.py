@@ -31,6 +31,7 @@ else:
 
 
 logger = init_logger(__name__)
+_so_guard_count = [0]   # grammar-rejected draft tokens seen (for rate-limited logging)
 
 
 class StructuredOutputManager:
@@ -294,6 +295,12 @@ class StructuredOutputManager:
 
                 state_advancements = 0
                 post_reasoning_end_in_window = False
+                # A draft token the grammar rejects outside a reasoning-end window used to raise AssertionError here
+                # and kill the engine. Now the grammar
+                # stops advancing for the rest of this request's window: the target samples position i under the
+                # bitmask of the state before the rejected draft, so draft i (and everything after it) is rejected in
+                # verification anyway; later rows' masks are irrelevant.
+                so_guard_stop = False
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
@@ -322,14 +329,17 @@ class StructuredOutputManager:
                             apply_bitmask = True
                             advance_grammar = False
                             post_reasoning_end_in_window = True
-                    if advance_grammar and not grammar.is_terminated():
+                    if advance_grammar and not so_guard_stop and not grammar.is_terminated():
                         accepted = grammar.accept_tokens(req_id, [token])
                         if accepted:
                             state_advancements += 1
                         elif not post_reasoning_end_in_window:
-                            raise AssertionError(
-                                (token, req_id, scheduled_spec_decode_tokens)
-                            )
+                            so_guard_stop = True
+                            _so_guard_count[0] += 1
+                            if _so_guard_count[0] <= 20 or _so_guard_count[0] % 1000 == 0:
+                                logger.warning("SO-GUARD: grammar rejected draft token %s at window position %d for "
+                                               "request %s; drafts after it are left to verification (%d so far)",
+                                               token, i, req_id, _so_guard_count[0])
                     cumulative_index += 1
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
