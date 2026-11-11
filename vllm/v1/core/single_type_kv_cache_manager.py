@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -1244,6 +1245,15 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
+            # EXL3_MAMBA_FREE (default 1; 0 = upstream): every superseded
+            # running-state block waits here until the step that read it has finished.
+            # Upstream remembers only the latest one (`last_state_block_idx`); with
+            # async scheduling the processed-token boundary lags one step, so that
+            # index is overwritten before it becomes freeable and one state block
+            # leaks per prefill chunk (28 held per Mamba group at 76k tokens: a fresh
+            # prompt over ~77k tokens could not fit in 182 blocks).
+            self._mamba_free = os.environ.get("EXL3_MAMBA_FREE", "1") != "0"
+            self._pending_state_blocks: dict[str, list[int]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1397,15 +1407,32 @@ class MambaManager(SingleTypeKVCacheManager):
             # The block allocated in the previous step is used to copy Mamba states
             # into the block allocated in the current step; the earlier block is
             # no longer needed and should be freed here.
+            boundary = cdiv(processed_computed_tokens, self.block_size) - 1
+            if self._mamba_free:
+                pending = self._pending_state_blocks.get(request_id)
+                if pending:
+                    blocks = self.req_to_blocks[request_id]
+                    keep: list[int] = []
+                    freed: list[KVCacheBlock] = []
+                    for idx in pending:
+                        if idx < boundary:
+                            if idx < len(blocks) and blocks[idx] != self._null_block:
+                                freed.append(blocks[idx])
+                                blocks[idx] = self._null_block
+                        else:
+                            keep.append(idx)
+                    if freed:
+                        self.block_pool.free_blocks(freed)
+                    if keep:
+                        self._pending_state_blocks[request_id] = keep
+                    else:
+                        self._pending_state_blocks.pop(request_id, None)
+                return
             last_state_block_idx = self.last_state_block_idx.get(request_id)
             # Blocks allocated during prefill may be non-contiguous. Use
             # `last_state_block_idx` to free the appropriate block and replace it
             # with a null block.
-            if (
-                last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
-            ):
+            if last_state_block_idx is not None and last_state_block_idx < boundary:
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
@@ -1538,10 +1565,18 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.last_state_block_idx[request_id] = (
                         prev_block_len - 1 - self.num_speculative_blocks
                     )
+                    if self._mamba_free:
+                        self._pending_state_blocks.setdefault(request_id, []).append(
+                            prev_block_len - 1 - self.num_speculative_blocks
+                        )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
+                    if self._mamba_free:
+                        self._pending_state_blocks.setdefault(request_id, []).append(
+                            prev_block_len - 1
+                        )
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
@@ -1607,6 +1642,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._pending_state_blocks.pop(request_id, None)
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
