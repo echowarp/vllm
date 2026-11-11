@@ -933,6 +933,13 @@ class OffloadingConnectorScheduler:
 
     _llmt_block_pool = None  # GPU block pool, set by the core scheduler (hybrid store filter)
     _llmt_ssm_skipped = 0
+    # EXL3_STATE_STORE=prompt_end stores a GDN/Mamba
+    # chunk only at the last or second-to-last full chunk of the prompt (align mode keeps a state only at the end of
+    # each scheduled prefill step; 39/40 prompts have their last state one chunk before the last full chunk, so the
+    # last full chunk alone stores almost nothing). In a replay of production traffic: same RAM-tier hit rate, ~40% fewer
+    # tier writes. Default "all" = unchanged (every chunk-end state the GPU prefix cache holds).
+    _llmt_state_store = os.environ.get("EXL3_STATE_STORE", "all")
+    _llmt_state_skipped = 0
 
     def _llmt_ssm_ok(self, group_config, block_id: int) -> bool:
         if group_config.sliding_window_size_in_chunks is None or self._llmt_block_pool is None:
@@ -1013,6 +1020,20 @@ class OffloadingConnectorScheduler:
                     # state; the others are allocated but never written. Store a Mamba chunk
                     # only if the GPU prefix cache holds it as a state block.
                     if not self._llmt_ssm_ok(group_config, block_id):
+                        continue
+                    if (
+                        self._llmt_state_store == "prompt_end"
+                        and group_config.sliding_window_size_in_chunks is not None
+                        and start_chunk_idx + key_idx
+                        not in (
+                            req.num_prompt_tokens // group_config.tokens_per_chunk - 2,
+                            req.num_prompt_tokens // group_config.tokens_per_chunk - 1,
+                        )
+                    ):
+                        self._llmt_state_skipped += 1
+                        if self._llmt_state_skipped in (1, 10, 100) or self._llmt_state_skipped % 1000 == 0:
+                            logger.info("STATE-STORE: prompt_end mode skipped %d Mamba chunk store(s) so far",
+                                        self._llmt_state_skipped)
                         continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
