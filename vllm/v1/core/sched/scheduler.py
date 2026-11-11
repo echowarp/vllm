@@ -67,6 +67,10 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# EXL3_HYBRID_CONN_LOOKUP=upstream restores upstream's per-group prefix lookup for hybrid (Mamba) models with a KV
+# connector; see schedule().
+_HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -770,9 +774,17 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    # Upstream's connector+Mamba branch takes max(per-group hits), i.e. it resumes
+                    # past the Mamba state or past the attention KV when the groups disagree (that is
+                    # only right for NIXL, which transfers the state unconditionally). With the
+                    # OffloadingConnector the request then computes on stale VRAM, and its blocks
+                    # enter the prefix cache under valid hashes (observed as chains of NaN outputs).
+                    # Default: the consistent all-groups hit (the no-connector path); the CPU tier
+                    # extends from there. EXL3_HYBRID_CONN_LOOKUP=upstream reverts.
                     if (
                         self.connector is not None
                         and self.has_mamba_layers
+                        and _HYBRID_CONN_UPSTREAM
                         and isinstance(
                             self.kv_cache_manager.coordinator,
                             HybridKVCacheCoordinator,
