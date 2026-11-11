@@ -3092,6 +3092,56 @@ class Scheduler(SchedulerInterface):
         return sync_failed_req_ids
 
 
+# MAMBA-RETENTION: with sparse Mamba/GDN state retention in the GPU prefix cache (upstream's
+# VLLM_PREFIX_CACHE_RETENTION_INTERVAL, tokens, a multiple of the block size; unset = dense = unchanged), a state is
+# kept only every interval, at the replay boundary (prompt end) and at Marconi shared-prefix junctions; intermediate
+# states are never cached (freed as superseded during the run), so nothing cached is ever dropped later.
+# EXL3_MAMBA_KEEP_LAST=K (default 2) also keeps the K-1 boundaries before each reachable one (hits that land a block
+# early, e.g. the MTP/EAGLE last-block rule). Counts state pages not cached and logs every EXL3_MAMBA_RETENTION_LOG
+# (default 200) skipped pages.
+def _install_mamba_retention():
+    if os.environ.get("VLLM_PREFIX_CACHE_RETENTION_INTERVAL") in (None, ""):
+        return
+    try:
+        from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    except Exception as e:  # noqa: BLE001
+        logger.warning("MAMBA-RETENTION: not installed (%r)", e)
+        return
+    keep = max(1, int(os.environ.get("EXL3_MAMBA_KEEP_LAST", "2") or 2))
+    every = max(1, int(os.environ.get("EXL3_MAMBA_RETENTION_LOG", "200") or 200))
+    orig = MambaManager.reachable_block_mask.__func__
+    st = {"skipped": 0, "kept": 0, "next": every}
+
+    def reachable_block_mask(cls, start_block, end_block, alignment_tokens, kv_cache_spec, use_eagle,
+                             retention_interval=None, reachable_boundaries=()):
+        rb = list(reachable_boundaries)
+        if retention_interval is not None and alignment_tokens:
+            for b in list(rb):
+                aligned = b // alignment_tokens * alignment_tokens
+                rb.extend(aligned - k * alignment_tokens for k in range(1, keep) if aligned - k * alignment_tokens > 0)
+        mask = orig(cls, start_block, end_block, alignment_tokens, kv_cache_spec, use_eagle,
+                    retention_interval=retention_interval, reachable_boundaries=rb)
+        if mask is not None:
+            n_keep = sum(1 for m in mask if m)
+            st["kept"] += n_keep
+            st["skipped"] += len(mask) - n_keep
+            if st["skipped"] >= st["next"]:
+                st["next"] += every
+                logger.info("MAMBA-RETENTION: %d state pages not cached, %d kept (interval %s tokens, keep last %d)",
+                            st["skipped"], st["kept"], retention_interval, keep)
+        return mask
+
+    MambaManager.reachable_block_mask = classmethod(reachable_block_mask)
+    logger.info("MAMBA-RETENTION: on (interval %s tokens, keep last %d)",
+                os.environ.get("VLLM_PREFIX_CACHE_RETENTION_INTERVAL"), keep)
+
+
+try:
+    _install_mamba_retention()
+except Exception as _e:  # noqa: BLE001
+    logger.warning("MAMBA-RETENTION: install failed (%r)", _e)
+
+
 # STALL-GUARD: generic liveness guard. Three scheduler deadlocks were found in an offline scheduler simulator
 # (HOLDER-RELEASE / HOL-HOLDERS fix the known ones); this catches the unknown ones. When requests are
 # pending but no token has been scheduled for EXL3_STALL_GUARD_S (5 s; 60 s while a KV load is in flight), it
