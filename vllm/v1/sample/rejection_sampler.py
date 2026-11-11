@@ -34,6 +34,29 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
 
+# with < 8 verify rows vLLM masks top-k/top-p with a full-vocab sort +
+# softmax + cumsum + scatter on 1-7 thread blocks (6 rows x 248k: ~540 us incl. the target softmax). flashinfer's
+# multi-CTA softmax -> top_k_renorm_probs -> top_p_renorm_probs gives the same target distribution (same kept sets,
+# |dprob| <= 2e-7 in tests) in ~156 us. The target logits then stay unmasked: only target_probs carry the constraint,
+# so it is used only when the caller does not return processed logprobs. EXL3_FI_TOPKP=1 enables.
+_EXL3_FI_TOPKP = os.environ.get("EXL3_FI_TOPKP", "0") == "1"
+_EXL3_FI_STASH: list = [None]
+
+
+def _exl3_fi_target_probs(logits, top_k, top_p):
+    try:
+        import flashinfer.sampling as fs
+        probs = fs.softmax(logits.contiguous())
+        if top_k is not None:
+            probs = fs.top_k_renorm_probs(probs, top_k.to(torch.int32))
+        if top_p is not None:
+            probs = fs.top_p_renorm_probs(probs, top_p.to(torch.float32))
+        return probs
+    except Exception as e:  # noqa
+        logger.warning_once("FI-TOPKP disabled: %s", e)
+        return None
+
+
 class RejectionSampler(nn.Module):
     """
     The implementation strictly follows the algorithm described in
@@ -170,6 +193,7 @@ class RejectionSampler(nn.Module):
             target_logits,
             metadata.cu_num_draft_tokens,
             sampling_metadata,
+            fi_ok=not self.is_processed_logprobs_mode,
         )
 
         output_token_ids = rejection_sample(
@@ -471,7 +495,12 @@ def rejection_sample(
             return output_token_ids
 
     # Compute probability distribution from target logits.
-    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+    st = _EXL3_FI_STASH[0]
+    if st is not None and st[0] is target_logits:
+        target_probs = st[1]                      # FI-TOPKP: already top-k/top-p renormalized
+        _EXL3_FI_STASH[0] = None
+    else:
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     assert target_probs.is_contiguous()
 
     # Sample recovered tokens for each position.
@@ -513,6 +542,7 @@ def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
     sampling_metadata: SamplingMetadata,
+    fi_ok: bool = False,
 ) -> torch.Tensor:
     """Process logits based on sampling metadata.
 
@@ -561,6 +591,14 @@ def apply_sampling_constraints(
             cu_num_draft_tokens,
             num_tokens,
         )
+
+    _EXL3_FI_STASH[0] = None
+    if (fi_ok and _EXL3_FI_TOPKP and logits.is_cuda and logits.dtype == torch.float32
+            and (top_k is not None or top_p is not None)):
+        probs = _exl3_fi_target_probs(logits, top_k, top_p)
+        if probs is not None:
+            _EXL3_FI_STASH[0] = (logits, probs)
+            return logits
 
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.

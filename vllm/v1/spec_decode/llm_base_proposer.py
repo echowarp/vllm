@@ -5,6 +5,8 @@ from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import os
+
 import torch
 import torch.nn as nn
 
@@ -1824,6 +1826,38 @@ class SpecDecodeBaseProposer:
 # Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
 # FIXME(woosuk): The logic here is duplicated with the main sampling code.
 # We should refactor this to reuse the same sampling implementation.
+# upstream drafts from the temperature-only distribution q while the
+# target p is cut to the request's top-k / top-p, so draft mass outside p's nucleus is always rejected. Sampling the
+# draft from q truncated + renormalized the same way (and passing that q' as draft_probs) keeps rejection sampling
+# exact and raises the overlap sum(min(p, q')). flashinfer softmax -> top_k_renorm -> top_p_renorm. EXL3_DRAFT_TOPKP=1.
+_EXL3_DRAFT_TOPKP = os.environ.get("EXL3_DRAFT_TOPKP", "0") == "1"
+
+
+def _exl3_rows(t, n):
+    if t is None or t.shape[0] == n:
+        return t
+    return t.repeat_interleave(n // t.shape[0], dim=0)
+
+
+def _exl3_draft_topkp(logits, sampling_metadata):
+    try:
+        import flashinfer.sampling as fs
+    except Exception:  # noqa
+        return None
+    n = logits.shape[0]
+    temp = _exl3_rows(sampling_metadata.temperature, n).to(torch.float32)
+    probs = fs.softmax(logits.float().div(temp.view(-1, 1)).contiguous())
+    k = _exl3_rows(sampling_metadata.top_k, n)
+    p = _exl3_rows(sampling_metadata.top_p, n)
+    if k is not None:
+        probs = fs.top_k_renorm_probs(probs, k.to(torch.int32))
+    if p is not None:
+        probs = fs.top_p_renorm_probs(probs, p.to(torch.float32))
+    q = torch.empty_like(probs)
+    q.exponential_()
+    return probs.div(q).argmax(dim=-1), probs
+
+
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1837,6 +1871,13 @@ def compute_probs_and_sample_next_token(
         return next_token_ids, probs
 
     assert sampling_metadata.temperature is not None
+    # (per-request generators are ignored here exactly as in upstream's draft sampling below: q.exponential_() unseeded)
+    if (_EXL3_DRAFT_TOPKP and sampling_metadata.all_random and logits.is_cuda
+            and logits.dim() == 2 and not use_fp64_gumbel
+            and (sampling_metadata.top_k is not None or sampling_metadata.top_p is not None)):
+        r = _exl3_draft_topkp(logits, sampling_metadata)
+        if r is not None:
+            return r
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold

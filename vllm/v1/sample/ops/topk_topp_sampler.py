@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -342,6 +344,9 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     return probs.div(q).argmax(dim=-1).view(-1)
 
 
+_EXL3_FI_SOFTMAX = os.environ.get("EXL3_FI_TOPKP", "0") == "1"
+
+
 def apply_top_k_top_p(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
@@ -488,6 +493,17 @@ def flashinfer_sample(
     import flashinfer
 
     assert not (k is None and p is None)
+    if _EXL3_FI_SOFTMAX:
+        # same steps as flashinfer's own top_k_first path / the branches
+        # below, but with flashinfer's multi-CTA softmax instead of torch.softmax (1 row x 248k: 47 -> 18 us)
+        fs = flashinfer.sampling
+        lf = logits.float().contiguous()
+        if k is not None:
+            lf = fs.top_k_mask_logits(lf, k)
+        probs = fs.softmax(lf)
+        if p is None:
+            return fs.top_k_sampling_from_probs(probs, k, deterministic=True).view(-1)
+        return fs.top_p_sampling_from_probs(probs, p, deterministic=True).view(-1)
     if k is None:
         # Top-p only.
         probs = logits.softmax(dim=-1, dtype=torch.float32)
