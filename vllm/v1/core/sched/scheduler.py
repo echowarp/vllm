@@ -316,6 +316,12 @@ class Scheduler(SchedulerInterface):
         self.lencap_req_ids: set[str] = set()
         self._lencap_wait_since: dict[str, float] = {}
 
+        # EXL3_SCHED_DECODE_STEPS=N (default 0 = upstream): after a step that ran prefill work next to
+        # running decodes, run N decode-only steps (reusing the DP defer_prefills path) so running
+        # streams keep generating during a long prefill.
+        self.decode_interleave = int(os.environ.get("EXL3_SCHED_DECODE_STEPS", "0"))
+        self._decode_only_left = 0
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -582,6 +588,12 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+        if self.decode_interleave and self._decode_only_left > 0:
+            self._decode_only_left -= 1
+            if any(not r.is_prefill_chunk for r in self.running):
+                defer_prefills = True
+            else:
+                self._decode_only_left = 0
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1243,6 +1255,12 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        if self.decode_interleave and not defer_prefills:
+            decode_max = 1 + self.num_spec_tokens
+            if any(n > decode_max for n in num_scheduled_tokens.values()) and any(
+                n <= decode_max for n in num_scheduled_tokens.values()
+            ):
+                self._decode_only_left = self.decode_interleave
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
