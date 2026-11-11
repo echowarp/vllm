@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
+import os
 
 from collections.abc import Sequence
 from dataclasses import replace
@@ -32,7 +33,6 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
-
 
 class RejectionSampler(nn.Module):
     """
@@ -696,6 +696,25 @@ def sample_recovered_tokens(
     inv_q = q.reciprocal()
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
+    # two-stage argmax over NSPLIT vocab slices per (request, position); the one-stage
+    # kernel runs only batch * max_spec_len programs over the whole 248k vocab (292 us at 1x5 on the B70).
+    # Same result: ties resolve to the lowest vocab index in both. EXL3_RECOVERED_2STAGE=0 restores upstream.
+    if os.environ.get("EXL3_RECOVERED_2STAGE", "1") == "1":
+        NSPLIT = 64
+        span = triton.cdiv(triton.cdiv(vocab_size, NSPLIT), 1024) * 1024
+        num_tokens = draft_token_ids.shape[0]
+        part_val = torch.empty((num_tokens, NSPLIT), dtype=q_dtype, device=device)
+        part_idx = torch.empty((num_tokens, NSPLIT), dtype=torch.int32, device=device)
+        sample_recovered_tokens_split_kernel[(batch_size, max_spec_len, NSPLIT)](
+            part_val, part_idx, cu_num_draft_tokens, draft_token_ids, draft_probs, target_probs, inv_q,
+            vocab_size, span, NSPLIT, 1024,
+            NO_DRAFT_PROBS=draft_probs is None,
+            USE_FP64_GUMBEL=use_fp64_gumbel,
+        )
+        sample_recovered_tokens_reduce_kernel[(batch_size, max_spec_len)](
+            recovered_token_ids, part_val, part_idx, cu_num_draft_tokens, vocab_size, NSPLIT,
+        )
+        return recovered_token_ids
     BLOCK_SIZE = 8192
     sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
         recovered_token_ids,
@@ -953,3 +972,67 @@ def sample_recovered_tokens_kernel(
 
     recovered_id = tl.minimum(recovered_id, vocab_size - 1)
     tl.store(output_token_ids_ptr + token_idx, recovered_id)
+
+
+@triton.jit
+def sample_recovered_tokens_split_kernel(
+    part_val_ptr, part_idx_ptr,  # [num_tokens, NSPLIT]
+    cu_num_draft_tokens_ptr, draft_token_ids_ptr, draft_probs_ptr, target_probs_ptr, inv_q_ptr,
+    vocab_size, span, NSPLIT: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    NO_DRAFT_PROBS: tl.constexpr, USE_FP64_GUMBEL: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    pos = tl.program_id(1)
+    if pos >= end_idx - start_idx:
+        return
+    split = tl.program_id(2)
+    token_idx = start_idx + pos
+    if NO_DRAFT_PROBS:
+        draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
+    if USE_FP64_GUMBEL:
+        max_val = tl.full((), float("-inf"), tl.float64)
+    else:
+        max_val = tl.full((), float("-inf"), tl.float32)
+    best = 0
+    v0 = split * span
+    for v in range(v0, v0 + span, BLOCK_SIZE):
+        off = v + tl.arange(0, BLOCK_SIZE)
+        vmask = off < vocab_size
+        if NO_DRAFT_PROBS:
+            prob = tl.load(target_probs_ptr + token_idx * vocab_size + off,
+                           mask=(vmask & (off != draft_token_id)), other=0.0)
+        else:
+            dp = tl.load(draft_probs_ptr + token_idx * vocab_size + off, mask=vmask, other=0.0)
+            tp = tl.load(target_probs_ptr + token_idx * vocab_size + off, mask=vmask, other=0.0)
+            prob = tl.maximum(tp - dp, 0.0)
+        iq = tl.load(inv_q_ptr + req_idx * vocab_size + off, mask=vmask, other=0.0)
+        score = tl.where(vmask, prob * iq, float("-inf"))
+        lmax, lid = tl.max(score, axis=0, return_indices=True)
+        if lmax > max_val:
+            max_val = lmax
+            best = v + lid
+    tl.store(part_val_ptr + token_idx * NSPLIT + split, max_val)
+    tl.store(part_idx_ptr + token_idx * NSPLIT + split, best)
+
+
+@triton.jit
+def sample_recovered_tokens_reduce_kernel(
+    output_token_ids_ptr, part_val_ptr, part_idx_ptr, cu_num_draft_tokens_ptr, vocab_size,
+    NSPLIT: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    pos = tl.program_id(1)
+    if pos >= end_idx - start_idx:
+        return
+    token_idx = start_idx + pos
+    offs = tl.arange(0, NSPLIT)
+    vals = tl.load(part_val_ptr + token_idx * NSPLIT + offs)
+    idxs = tl.load(part_idx_ptr + token_idx * NSPLIT + offs)
+    m, j = tl.max(vals, axis=0, return_indices=True)   # first split with the max = lowest vocab index
+    rid = tl.sum(tl.where(offs == j, idxs, 0), axis=0)
+    rid = tl.minimum(rid, vocab_size - 1)
+    tl.store(output_token_ids_ptr + token_idx, rid)
