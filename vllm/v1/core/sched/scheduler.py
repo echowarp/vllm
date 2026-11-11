@@ -71,6 +71,9 @@ logger = init_logger(__name__)
 # EXL3_HYBRID_CONN_LOOKUP=upstream restores upstream's per-group prefix lookup for hybrid (Mamba) models with a KV
 # connector; see schedule().
 _HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
+# MIXED-PROPOSE (see schedule()): draft depth PROPOSED for decode rows when the next step carries a prefill chunk: ""
+# off, "max", or a depth. Distinct from EXL3_SCHED_MIXED_K (caps the drafts SCHEDULED in such a step).
+_MIXED_PROPOSE = os.environ.get("EXL3_SCHED_MIXED_PROPOSE", "")
 
 # EAGLE-KEEP: with EAGLE/MTP, vLLM drops the last matched block of every prefix hit (the drafter's KV entry at the
 # block's last position needs the next token, so it may be missing) and saves the Mamba/GDN state one block early to
@@ -321,6 +324,18 @@ class Scheduler(SchedulerInterface):
         # streams keep generating during a long prefill.
         self.decode_interleave = int(os.environ.get("EXL3_SCHED_DECODE_STEPS", "0"))
         self._decode_only_left = 0
+        # EXL3_SCHED_MIXED_CHUNK=N[,N2,...] (0 = off): while running requests are decoding, cap a prefill
+        # chunk at N tokens (rounded up to a whole number of KV blocks: Mamba align mode ends chunks on
+        # block boundaries), so a step that mixes prefill with decodes stalls the decoders less (with
+        # 832-token blocks, ~0.45 s instead of ~1.1 s). Dynamic form "1664,832": cap when 1, 2, ...
+        # requests are decoding (last value for more); "" or "0" = off.
+        self.mixed_chunk = [int(x) for x in os.environ.get("EXL3_SCHED_MIXED_CHUNK", "0").replace(" ", "").split(",") if x]
+        # EXL3_SCHED_MIXED_K=k (-1 = off): in a step that also runs an in-progress prefill chunk
+        # (compute-bound), schedule only the first k draft tokens of each decoding request: draft rows
+        # cost real compute there (about one prefill token each) but yield only their acceptance
+        # probability.
+        self.mixed_k = int(os.environ.get("EXL3_SCHED_MIXED_K", "-1"))
+        self._llmt_chunk_cap = 0
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -588,6 +603,14 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+        _ndec = sum(1 for r in self.running if not r.is_prefill_chunk)
+        self._llmt_chunk_cap = (self.mixed_chunk[min(_ndec, len(self.mixed_chunk)) - 1]
+                                if self.mixed_chunk and _ndec > 0 else 0)
+        # The cap must be a whole number of attention blocks or the Mamba block floor empties every
+        # capped chunk and a new prompt waits until no request decodes.
+        if self._llmt_chunk_cap > 0:
+            _bs = self.cache_config.block_size
+            self._llmt_chunk_cap = max(_bs, -(-self._llmt_chunk_cap // _bs) * _bs)
         if self.decode_interleave and self._decode_only_left > 0:
             self._decode_only_left -= 1
             if any(not r.is_prefill_chunk for r in self.running):
@@ -595,6 +618,8 @@ class Scheduler(SchedulerInterface):
             else:
                 self._decode_only_left = 0
 
+        _llmt_trim = (self.mixed_k if self.mixed_k >= 0 and not defer_prefills
+                      and any(r.is_prefill_chunk for r in self.running) else -1)
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -635,6 +660,10 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < self._llmt_chunk_cap < num_new_tokens and request.is_prefill_chunk:  # MIXED-CHUNK
+                num_new_tokens = self._llmt_chunk_cap
+            if _llmt_trim >= 0 and not request.is_prefill_chunk and len(request.spec_token_ids) > _llmt_trim:
+                num_new_tokens -= len(request.spec_token_ids) - _llmt_trim  # MIXED-K: trim drafts
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -1041,6 +1070,8 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    if 0 < self._llmt_chunk_cap < num_new_tokens:  # MIXED-CHUNK (new prompt, decoders running)
+                        num_new_tokens = self._llmt_chunk_cap
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1332,6 +1363,21 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        # MIXED-PROPOSE: when the NEXT step will carry a prefill chunk (a running request still has prompt
+        # tokens to compute, or requests wait), the decode rows ride along a prefill-bound step (~1.2 s) where
+        # extra draft rows cost almost nothing, so propose the maximum depth for them instead of the batch-size
+        # depth (k=3 at 3+ requests): each decoder advances up to 2x further per expensive step. Exact
+        # verification -> outputs unchanged. EXL3_SCHED_MIXED_PROPOSE=max|n (EXL3_SCHED_MIXED_K caps what is
+        # scheduled).
+        if _MIXED_PROPOSE and len(num_scheduled_tokens) > 0:
+            if self.waiting or any(r.num_computed_tokens + num_scheduled_tokens.get(r.request_id, 0) < r.num_prompt_tokens
+                                   for r in self.running):
+                k_mixed = self.num_spec_tokens if _MIXED_PROPOSE == "max" else max(0, min(self.num_spec_tokens, int(_MIXED_PROPOSE)))
+                if k_mixed != num_spec_tokens_to_schedule:
+                    num_spec_tokens_to_schedule = k_mixed
+                    self._llmt_mixk = getattr(self, "_llmt_mixk", 0) + 1
+                    if self._llmt_mixk in (1, 100) or self._llmt_mixk % 1000 == 0:
+                        logger.info("MIXED-PROPOSE: %d steps proposed depth %d for decode rows beside a prefill chunk", self._llmt_mixk, k_mixed)
 
         scheduled_encoder_input_stats = None
         if (
