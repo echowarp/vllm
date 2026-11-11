@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -30,6 +31,112 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 )
 
 logger = init_logger(__name__)
+
+
+# ---- RAM-tier store NaN scan -------------------------------------------------------------------------
+# Every GPU->CPU store is scanned for NaN/inf in its RAM copy by one background thread (nice 10) before
+# the store is reported complete; a store with a non-finite value is reported failed, so the scheduler
+# frees those chunks instead of making them available to later prefix hits ("OFFLOAD-NAN:" lines).
+# Page layouts per KV group / data ref come from the connector worker (set_layout). EXL3_KV_NANCHECK=0
+# disables.
+import ctypes as _ct
+import os as _os
+import queue as _queue
+import threading as _threading
+
+_NC_MASKS = {  # dtype -> (numpy uint view, abs mask, first non-finite pattern)
+    torch.float16: (np.uint16, 0x7FFF, 0x7C00),
+    torch.bfloat16: (np.uint16, 0x7FFF, 0x7F80),
+    torch.float32: (np.uint32, 0x7FFFFFFF, 0x7F800000),
+}
+_NC_LAYOUT: list[list[list[tuple[int, int, torch.dtype]]]] | None = None
+
+
+def set_layout(group_segs) -> None:
+    """group -> data ref -> [(byte offset in page, bytes, dtype)]."""
+    global _NC_LAYOUT
+    _NC_LAYOUT = group_segs
+
+
+class _NanChecker:
+    def __init__(self):
+        self.on = _os.environ.get("EXL3_KV_NANCHECK", "1") == "1"
+        self.q: _queue.Queue = _queue.Queue()
+        self.done: _queue.Queue = _queue.Queue()
+        self.n_jobs = self.n_bad = self.n_bytes = 0
+        self.t_scan = 0.0
+        self.last_log = time.monotonic()
+        self.buf = np.empty(0, dtype=np.uint8)
+        self.th = None
+        if self.on:
+            self.th = _threading.Thread(target=self._run, name="kv-nancheck", daemon=True)
+            self.th.start()
+            logger.info("KV-NANCHECK on: RAM-tier stores are scanned for NaN/inf before they become hits")
+
+    def _run(self):
+        try:
+            _os.setpriority(_os.PRIO_PROCESS, _threading.get_native_id(), 10)
+        except Exception:
+            pass
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            result, ops = item
+            t0 = time.monotonic()
+            bad = None
+            try:
+                bad = self._scan(result.job_id, ops)
+            except Exception as e:  # never fail the engine on a scanner bug
+                logger.warning("KV-NANCHECK: scan error on store job %d: %r", result.job_id, e)
+            dt = time.monotonic() - t0
+            self.t_scan += dt
+            self.n_jobs += 1
+            if bad is not None:
+                self.n_bad += 1
+                result = TransferResult(job_id=result.job_id, success=False,
+                                        transfer_size=result.transfer_size,
+                                        transfer_time=result.transfer_time)
+                logger.warning(
+                    "OFFLOAD-NAN: store job %d has NaN/inf in its RAM copy (group %d, ref %d, dtype %s, page %d of %d, "
+                    "byte offset %d); reported failed -> chunks dropped from the RAM tier (scan %.1f ms)",
+                    result.job_id, *bad, dt * 1e3)
+            self.done.put(result)
+            now = time.monotonic()
+            if now - self.last_log > 600:
+                logger.info("KV-NANCHECK: %d store jobs, %.2f GiB scanned, %d failed, scan time %.1f s (since start)",
+                            self.n_jobs, self.n_bytes / 2**30, self.n_bad, self.t_scan)
+                self.last_log = now
+
+    def _view(self, ptr: int, nbytes: int, utype) -> np.ndarray:
+        return np.frombuffer((_ct.c_char * nbytes).from_address(ptr), dtype=utype)
+
+    def _scan(self, job_id: int, ops):
+        """ops: list of (dst ptrs ndarray, page bytes, group, ref). Returns None or the first bad page."""
+        layout = _NC_LAYOUT
+        if layout is None:
+            return None
+        for ptrs, page, g, r in ops:
+            segs = layout[g][r]
+            for i, base in enumerate(ptrs):
+                for off, n, dt in segs:
+                    m = _NC_MASKS.get(dt)
+                    if m is None or n <= 0:
+                        continue
+                    utype, mask, pat = m
+                    x = self._view(int(base) + off, n, utype)
+                    if self.buf.nbytes < n:
+                        self.buf = np.empty(n, dtype=np.uint8)
+                    t = self.buf[:n].view(utype)
+                    np.bitwise_and(x, mask, out=t)
+                    self.n_bytes += n
+                    if t.max() >= pat:
+                        return (g, r, str(dt), i, len(ptrs), off)
+        return None
+
+    def shutdown(self):
+        if self.th is not None:
+            self.q.put(None)
 
 
 def _select_swap_blocks_fn(
@@ -236,6 +343,8 @@ class SingleDirectionOffloadingHandler:
         self._event_pool: list[torch.Event] = []
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._nanchk = _NanChecker() if gpu_to_cpu else None
+        self._nc_ops: dict[int, list] = {}
 
     def transfer_async(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
@@ -307,9 +416,10 @@ class SingleDirectionOffloadingHandler:
         op_idx = 0
         # count total number of bytes copied
         num_transfer_bytes = 0
-        for group_size, block_idx, group_data_refs in zip(
+        _nc_ranges = []  # (op start, op end, group, ref)
+        for _nc_g, (group_size, block_idx, group_data_refs) in enumerate(zip(
             group_sizes, block_indices, self.kv_cache_groups_data_refs
-        ):
+        )):
             if group_size == 0:
                 continue
 
@@ -329,9 +439,10 @@ class SingleDirectionOffloadingHandler:
             group_src = src_blocks[src_offset:src_end_offset]
             group_dst = dst_blocks[dst_offset:dst_end_offset]
 
-            for data_ref in group_data_refs:
+            for _nc_r, data_ref in enumerate(group_data_refs):
                 t_idx = data_ref.tensor_idx
                 end_idx = op_idx + group_size
+                _nc_ranges.append((op_idx, end_idx, _nc_g, _nc_r, data_ref.page_size_bytes))
 
                 compute_sub_block_ptrs(
                     group_src,
@@ -400,6 +511,8 @@ class SingleDirectionOffloadingHandler:
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
+        if self._nanchk is not None and self._nanchk.on:
+            self._nc_ops[job_id] = _nc_ranges
         self._transfers.append(
             Transfer(
                 job_id=job_id,
@@ -430,7 +543,15 @@ class SingleDirectionOffloadingHandler:
                 transfer_time=transfer_time,
             )
 
-            results.append(result)
+            ranges = self._nc_ops.pop(transfer.job_id, None)
+            if ranges is not None:
+                # copy the destination page pointers before the descriptor
+                # buffers go back to the pool; the result is reported once the scan has finished.
+                dst_all = transfer.batch_dst.numpy()
+                nc_ops = [(dst_all[a:b].copy(), page, g, r) for a, b, g, r, page in ranges]
+                self._nanchk.q.put((result, nc_ops))
+            else:
+                results.append(result)
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
@@ -438,6 +559,12 @@ class SingleDirectionOffloadingHandler:
                 (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
             )
             del self._transfer_events[transfer.job_id]
+        if self._nanchk is not None:
+            while True:
+                try:
+                    results.append(self._nanchk.done.get_nowait())
+                except _queue.Empty:
+                    break
         return results
 
     def wait(self, job_ids: set[int]):
@@ -447,6 +574,8 @@ class SingleDirectionOffloadingHandler:
                 event.synchronize()
 
     def shutdown(self) -> None:
+        if self._nanchk is not None:
+            self._nanchk.shutdown()
         while self._transfers:
             transfer = self._transfers.popleft()
             transfer.end_event.synchronize()
