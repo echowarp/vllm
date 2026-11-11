@@ -5,6 +5,8 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -53,7 +55,12 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# Parallel softmax segments for the 3D kernel. 32 instead of 16: one 20k-token sequence on an RTX 5090 drops from
+# 177 to 138 us per layer. Override with EXL3_ATTN_SEGMENTS.
+NUM_PAR_SOFTMAX_SEGMENTS = int(os.environ.get("EXL3_ATTN_SEGMENTS", "32"))
+# Spec-decode verify steps use the 3D kernel too (see unified_attention), so the segment buffers hold up to
+# EXL3_ATTN_3D_MAXQ query rows (k + 1) per sequence.
+_ATTN_3D_ROWS = int(os.environ.get("EXL3_ATTN_3D_MAXQ", "8"))
 
 
 @dataclass
@@ -155,7 +162,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                self.seq_threshold_3D * _ATTN_3D_ROWS,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -164,12 +171,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (self.seq_threshold_3D * _ATTN_3D_ROWS, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (self.seq_threshold_3D * _ATTN_3D_ROWS, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
