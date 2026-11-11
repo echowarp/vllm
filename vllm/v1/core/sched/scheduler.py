@@ -611,6 +611,11 @@ class Scheduler(SchedulerInterface):
                         # wait (up to 30 s) instead of capping a request that would fit.
                         # Otherwise it will never fit, even after a preemption and
                         # re-prefill: hand it back as length-capped.
+                        # HOLDER-RELEASE: waiting requests whose prefix was restored (CPU tier)
+                        # hold blocks without running; release them (their KV stays in the CPU
+                        # tier / prefix cache) instead of waiting or capping.
+                        if self._release_waiting_holders(request):
+                            continue
                         if self._lencap_should_wait(request):
                             break
                         self._lencap(request, "does not fit in the KV cache")
@@ -710,6 +715,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            _holders_only = False  # HOL-HOLDERS: after an allocation miss, only block holders
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -733,6 +739,11 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if _holders_only and not self._waiting_holds_blocks(request):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -998,6 +1009,17 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # HOL-HOLDERS: a request whose CPU-tier load finished holds its blocks but is only
+                    # promoted when this loop reaches it; a head request that cannot fit (because of
+                    # those very blocks) must not stop the loop. Skip ahead to block holders only.
+                    # EXL3_HOL_HOLDERS=0 disables.
+                    if (not _holders_only and os.environ.get("EXL3_HOL_HOLDERS", "1") == "1"
+                            and self._ready_holder_waiting(request)):
+                        _holders_only = True
+                        self.hol_skips = getattr(self, "hol_skips", 0) + 1
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1253,6 +1275,58 @@ class Scheduler(SchedulerInterface):
             skip.clear()
 
         return new_block_ids_to_zero or None
+
+    def _waiting_holds_blocks(self, r: Request) -> bool:
+        """HOL-HOLDERS: a waiting request that holds GPU blocks (finished load, or promoted after one)."""
+        if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return r.request_id in self.finished_recving_kv_req_ids
+        try:
+            return any(
+                any(not b.is_null for b in m.req_to_blocks.get(r.request_id, ()))
+                for m in self.kv_cache_manager.coordinator.single_type_managers
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _ready_holder_waiting(self, request: Request) -> bool:
+        for q in (self.waiting, self.skipped_waiting):
+            for r in q:
+                if r is not request and self._waiting_holds_blocks(r):
+                    return True
+        return False
+
+    def _release_waiting_holders(self, request: Request, force: bool = False) -> bool:
+        """HOLDER-RELEASE: free the blocks of every WAITING or PREEMPTED request that holds any (not ones still
+        loading), reset its computed tokens and drop its async-load reservation so it is looked up again.
+        EXL3_HOLDER_RELEASE=0 disables (the stall guard forces it regardless)."""
+        if not force and os.environ.get("EXL3_HOLDER_RELEASE", "1") != "1":
+            return False
+        freed, nreq = 0, 0
+        queues = [self.waiting] + ([self.skipped_waiting] if hasattr(self, "skipped_waiting") else [])
+        for q in queues:
+            for r in list(q):
+                if r is request or r.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                    continue
+                try:
+                    held = sum(
+                        sum(1 for b in m.req_to_blocks.get(r.request_id, ()) if not b.is_null)
+                        for m in self.kv_cache_manager.coordinator.single_type_managers
+                    )
+                except Exception:  # noqa: BLE001
+                    held = 0
+                if held <= 0:
+                    continue
+                self.kv_cache_manager.free(r)
+                r.num_computed_tokens = 0
+                # left in _inflight_prefills it reserves its own remaining blocks against its re-admission
+                self._inflight_prefills.discard(r)
+                freed += held; nreq += 1
+        if freed:
+            self.holder_releases = getattr(self, "holder_releases", 0) + 1
+            logger.warning("HOLDER-RELEASE: freed %d blocks of %d waiting request(s) for running request %s "
+                           "(%d tokens)", freed, nreq, getattr(request, "request_id", "stall-guard"),
+                           getattr(request, "num_tokens", 0))
+        return freed > 0
 
     def _lencap_should_wait(self, request: Request) -> bool:
         pool = self.kv_cache_manager.block_pool
