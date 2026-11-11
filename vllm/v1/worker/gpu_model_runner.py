@@ -296,6 +296,7 @@ _TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llm
 # the corrections are applied after the launch, as in non-align async mode. Other steps keep the synchronous path.
 # EXL3_ALIGN_NOSYNC=1 enables it.
 _ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
+_RC_PINNED = os.environ.get("EXL3_RC_PINNED", "0") == "1"  # RC-PINNED (see _llmt_gdn_rc)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -7853,9 +7854,32 @@ class GPUModelRunner(
             self._rc_warn += 1
             if self._rc_warn <= 20:
                 logger.warning("GDN-RC: speculative rows are not the leading batch rows (%s); composite path assumes they are", spec_rows)
-        st["npend"][:n].copy_(torch.from_numpy(a_np)); st["slot"][:n].copy_(torch.from_numpy(a_sl))
-        st["par"][:n].copy_(torch.from_numpy(a_pa)); st["bidx"][:n].copy_(torch.from_numpy(a_bi))
-        st["bblk"][:, :n].copy_(torch.from_numpy(a_bb))
+        if _RC_PINNED:
+            # RC-PINNED: copies from pageable numpy memory are synchronous in CUDA (the CPU waits
+            # until the stream has drained, i.e. until the previous step finished): with 5 of them per step the CPU could
+            # never prepare a step while the GPU ran the last one (~2.6 ms GPU idle per step on an RTX 5090). Stage through a
+            # ring of pinned buffers and copy asynchronously; stream order keeps the copy ahead of this step's forward.
+            G = len(gids)
+            ring = getattr(self, "_rc_ring", None)
+            if ring is None or ring[0][0].numel() < (4 + G) * self.max_num_reqs:
+                ring = self._rc_ring = [(torch.empty((4 + G) * self.max_num_reqs, dtype=torch.int32, pin_memory=True),
+                                         torch.xpu.Event()) for _ in range(4)]
+                self._rc_ring_i = 0
+            buf, ev = ring[self._rc_ring_i]
+            self._rc_ring_i = (self._rc_ring_i + 1) % len(ring)
+            ev.synchronize()                    # this slot's copy from 4 steps ago is done long since
+            hb = buf.numpy()
+            for j, arr in enumerate((a_np, a_sl, a_pa, a_bi)):
+                hb[j * n:(j + 1) * n] = arr
+            hb[4 * n:(4 + G) * n] = a_bb.reshape(-1)
+            st["npend"][:n].copy_(buf[0:n], non_blocking=True); st["slot"][:n].copy_(buf[n:2 * n], non_blocking=True)
+            st["par"][:n].copy_(buf[2 * n:3 * n], non_blocking=True); st["bidx"][:n].copy_(buf[3 * n:4 * n], non_blocking=True)
+            st["bblk"][:, :n].copy_(buf[4 * n:(4 + G) * n].view(G, n), non_blocking=True)
+            ev.record()
+        else:
+            st["npend"][:n].copy_(torch.from_numpy(a_np)); st["slot"][:n].copy_(torch.from_numpy(a_sl))
+            st["par"][:n].copy_(torch.from_numpy(a_pa)); st["bidx"][:n].copy_(torch.from_numpy(a_bi))
+            st["bblk"][:, :n].copy_(torch.from_numpy(a_bb))
         # Rows beyond n (graph padding) must not replay a stale pending slot or write a stale
         # boundary block (latent today: capture sizes are multiples of 7, but guard anyway)
         st["npend"][n:].zero_(); st["bidx"][n:].fill_(-1)
