@@ -2968,3 +2968,14 @@ class Qwen3VLForConditionalGeneration(
 @lru_cache
 def _cached_tensor(x, device) -> torch.Tensor:
     return torch.tensor(x, device=device)
+
+
+# Optional lazy vision tower: if the llmt_lazyvis module is installed (shipped with the EXL3 plugin) and
+# EXL3_LAZY_VISION=1, the vision tower lives in host memory and is moved to the GPU only for image requests, so its
+# VRAM goes to the KV cache. Without the module this is a no-op.
+try:
+    import llmt_lazyvis as _lazyvis
+
+    _lazyvis.install()
+except Exception as _e:  # noqa: BLE001
+    logger.warning("lazyvis not installed: %r", _e)
