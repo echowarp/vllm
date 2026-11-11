@@ -251,6 +251,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _MAMBA_ACC_FIX = os.environ.get("EXL3_MAMBA_ACC_FIX", "1") == "1"  # MAMBA-ACC (see execute_model)
+_GDN_RC_ON = os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1"  # GDN-RECOMPUTE (see _llmt_gdn_rc)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4372,6 +4373,11 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
+                if _GDN_RC_ON:
+                    try:
+                        self._llmt_gdn_rc(scheduler_output, mamba_bufs.preprocess)
+                    except Exception as _e:
+                        logger.warning("GDN-RC: hook failed: %r", _e)
                 # MAMBA-ACC: num_accepted_tokens only means something for a request whose previous step was a
                 # speculative decode. A request in prefill could inherit another request's count when the batch
                 # was condensed (async row remap + non-blocking D2H of the counts), and preprocess_mamba then
@@ -7694,6 +7700,82 @@ class GPUModelRunner(
                 else:
                     break
 
+    def _llmt_gdn_rc(self, scheduler_output, copy_bufs) -> None:
+        """GDN-RECOMPUTE: per-request pending-token bookkeeping for the EXL3 runtime plugin's GDN recompute op
+        (exl3cuda.vllm_plugin, GDN_RC): pool slot + read parity (keyed by request id, not batch row), number of
+        pending tokens = the previous spec step's accepted count (0 for new/resumed/recomputed requests), and the
+        decode-time boundary state (pending index + block per GDN group) that the fused postprocess used to copy."""
+        from exl3cuda.vllm_plugin import GDN_RC
+        GDN_RC["step"] = GDN_RC.get("step", 0) + 1   # per-step key of the plugin's index cache
+        st = GDN_RC["buf"]
+        gids = copy_bufs.mamba_group_ids
+        if not hasattr(self, "_rc_slot"):
+            self._rc_slot, self._rc_par, self._rc_free = {}, {}, list(range(GDN_RC["S"] - 1, -1, -1))
+            self._rc_warn = 0
+        # free slots of finished requests and of any request the runner no longer tracks (finished ids of steps that
+        # did not execute the model never reach this hook)
+        for rid in [r for r in self._rc_slot if r not in self.requests or r in (scheduler_output.finished_req_ids or ())]:
+            sl = self._rc_slot.pop(rid)
+            if sl not in self._rc_free:
+                self._rc_free.append(sl)
+            self._rc_par.pop(rid, None)
+        prev = getattr(self, "_llmt_prev_spec_reqs", set())
+        spec_now = scheduler_output.scheduled_spec_decode_tokens
+        resumed = scheduler_output.scheduled_cached_reqs.resumed_req_ids or ()
+        bs = copy_bufs.mamba_spec.block_size
+        n = self.input_batch.num_reqs
+        a_np = np.zeros(n, dtype=np.int32); a_sl = np.zeros(n, dtype=np.int32); a_pa = np.zeros(n, dtype=np.int32)
+        a_bi = np.full(n, -1, dtype=np.int32); a_bb = np.zeros((len(gids), n), dtype=np.int32)
+        spec_rows = []
+        for i, rid in enumerate(self.input_batch.req_ids[:n]):
+            rs = self.requests[rid]
+            if rid not in self._rc_slot:
+                if not self._rc_free:
+                    self._rc_warn += 1
+                    if self._rc_warn <= 5:
+                        logger.warning("GDN-RC: pending slot pool exhausted (%d slots); request %s shares slot 0", GDN_RC["S"], rid)
+                    self._rc_slot[rid] = 0
+                else:
+                    self._rc_slot[rid] = self._rc_free.pop()
+                self._rc_par[rid] = 0
+            a_sl[i] = self._rc_slot[rid]; a_pa[i] = self._rc_par[rid]
+            npend = 0
+            if rid in prev and rid not in resumed and rs.num_computed_tokens > 0:
+                npend = int(self.input_batch.num_accepted_tokens_cpu[i])
+            a_np[i] = npend
+            if npend > 0:
+                run = rs.num_computed_tokens - npend + 1
+                aligned = rs.num_computed_tokens // bs * bs
+                if aligned >= run and aligned >= bs:
+                    blks = [rs.block_ids[g][aligned // bs - 1] if aligned // bs - 1 < len(rs.block_ids[g]) else 0 for g in gids]
+                    if all(b > 0 for b in blks):
+                        a_bi[i] = aligned - run
+                        for gi, b in enumerate(blks):
+                            a_bb[gi, i] = b
+            if rid in spec_now:
+                spec_rows.append(i)
+            elif npend > 0:
+                # Accepted tokens pending but no drafts this step -> the closed op (non-spec path)
+                # does not replay them: the request's GDN state would silently miss npend tokens. Count and report.
+                self._rc_drop = getattr(self, "_rc_drop", 0) + 1
+                if self._rc_drop <= 20 or self._rc_drop % 100 == 0:
+                    logger.warning("GDN-RC-DROP: request %s has %d pending tokens but no drafts this step (total %d)",
+                                   rid, npend, self._rc_drop)
+        GDN_RC["lead"] = spec_rows == list(range(len(spec_rows)))   # RC-SLICE: non-spec rows are one contiguous tail
+        if spec_rows != list(range(len(spec_rows))):
+            self._rc_warn += 1
+            if self._rc_warn <= 20:
+                logger.warning("GDN-RC: speculative rows are not the leading batch rows (%s); composite path assumes they are", spec_rows)
+        st["npend"][:n].copy_(torch.from_numpy(a_np)); st["slot"][:n].copy_(torch.from_numpy(a_sl))
+        st["par"][:n].copy_(torch.from_numpy(a_pa)); st["bidx"][:n].copy_(torch.from_numpy(a_bi))
+        st["bblk"][:, :n].copy_(torch.from_numpy(a_bb))
+        # Rows beyond n (graph padding) must not replay a stale pending slot or write a stale
+        # boundary block (latent today: capture sizes are multiples of 7, but guard anyway)
+        st["npend"][n:].zero_(); st["bidx"][n:].fill_(-1)
+        for rid in spec_now:
+            if rid in self._rc_par:
+                self._rc_par[rid] ^= 1
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -7741,6 +7823,23 @@ class GPUModelRunner(
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+        if _GDN_RC_ON and not is_profiling:   # GDN-RECOMPUTE: buffers must exist before graph capture
+            try:
+                from exl3cuda.vllm_plugin import GDN_RC
+                gids = [i for i, g in enumerate(kv_cache_config.kv_cache_groups) if isinstance(g.kv_cache_spec, MambaSpec)]
+                R = self.input_batch.max_num_reqs
+                st = {k: torch.zeros(R, dtype=torch.int32, device=self.device) for k in ("npend", "slot", "par")}
+                st["bidx"] = torch.full((R,), -1, dtype=torch.int32, device=self.device)
+                st["bblk"] = torch.zeros((len(gids), R), dtype=torch.int32, device=self.device)
+                GDN_RC["layer_group"] = {name: gi for gi, gid in enumerate(gids)
+                                         for name in kv_cache_config.kv_cache_groups[gid].layer_names}
+                GDN_RC["buf"] = st
+                logger.info("GDN-RC: buffers for %d requests, %d GDN groups", R, len(gids))
+                if "alloc" in GDN_RC:   # per-layer pending pools before graph capture
+                    GDN_RC["alloc"](self.compilation_config.static_forward_context, self.device)
+            except Exception as _e:
+                logger.warning("GDN-RC: init failed: %r", _e)
 
         if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
