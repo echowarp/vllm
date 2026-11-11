@@ -285,6 +285,7 @@ def _is_qwen3_next_plain_mrope_eligible(
 
 _MAMBA_ACC_FIX = os.environ.get("EXL3_MAMBA_ACC_FIX", "1") == "1"  # MAMBA-ACC (see execute_model)
 _GDN_RC_ON = os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1"  # GDN-RECOMPUTE (see _llmt_gdn_rc)
+_TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llmt_tail_hold)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -1247,6 +1248,11 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if _TAIL_HOLD:   # TAIL-HOLD: flush held GDN states before any CoW copy of this step runs
+            try:
+                self._llmt_tail_hold(scheduler_output)
+            except Exception as _e:
+                logger.warning("TAIL-HOLD: runner hook failed: %r", _e)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -7764,6 +7770,8 @@ class GPUModelRunner(
         # did not execute the model never reach this hook)
         for rid in [r for r in self._rc_slot if r not in self.requests or r in (scheduler_output.finished_req_ids or ())]:
             sl = self._rc_slot.pop(rid)
+            if _TAIL_HOLD:
+                getattr(self, "_th_last", {}).pop(rid, None)
             if sl not in self._rc_free:
                 self._rc_free.append(sl)
             self._rc_par.pop(rid, None)
@@ -7800,6 +7808,14 @@ class GPUModelRunner(
                         a_bi[i] = aligned - run
                         for gi, b in enumerate(blks):
                             a_bb[gi, i] = b
+            if _TAIL_HOLD:   # TAIL-HOLD: the state block this step's kernel commits into, per GDN group
+                th_last = self.__dict__.setdefault("_th_last", {})
+                if rid in spec_now:
+                    q = scheduler_output.num_scheduled_tokens.get(rid, 0)
+                    sidx = (rs.num_computed_tokens + q - 1) // bs
+                    th_last[rid] = (True, {g: (rs.block_ids[g][sidx] if sidx < len(rs.block_ids[g]) else -1) for g in gids})
+                else:
+                    th_last[rid] = (False, None)
             if rid in spec_now:
                 spec_rows.append(i)
             elif npend > 0:
@@ -7823,6 +7839,131 @@ class GPUModelRunner(
         for rid in spec_now:
             if rid in self._rc_par:
                 self._rc_par[rid] ^= 1
+
+    def _llmt_tail_hold(self, scheduler_output) -> None:
+        """TAIL-HOLD, runner side (scheduler side and design: core/sched/scheduler.py _TailHold).
+
+        Runs at the start of _update_states, i.e. after every earlier step and
+        before this step's CoW copies. For each new hold (rid, L, {group: state block}, nspec): apply the ONE pending
+        token of the request's last spec step to its committed SSM state (gdn_rc kernel with n_pend = 1 and no new
+        tokens) -> SSM state at L = N + 1; conv rows 0..2 already hold the window ending at L. Requires that step's
+        state block (recorded in _llmt_gdn_rc) to match the scheduler's, and the request's pending-pool slot (freed
+        later in this step by _llmt_gdn_rc). On any failure the held state is filled with NaN (the successor's NaN
+        logits trigger NAN-PREEMPT, a full recompute) and the scheduler zeroes the block when the hold is released."""
+        def GDN_RC_STEP():
+            try:
+                from exl3xpu.vllm_plugin import GDN_RC as _g
+                return int(_g.get("step", 0))
+            except Exception:
+                return -1
+        from vllm.v1.core.sched import scheduler as _sm
+        sh = _sm._TH_SHARED
+        if not sh["runner_ok"]:
+            if _GDN_RC_ON and self.cache_config.mamba_cache_mode == "align":
+                sh["runner_ok"] = True
+                logger.info("TAIL-HOLD: runner ready (GDN recompute, align mode)")
+                try:   # tool-call end token ids for ranking holds (scheduler _TailHold.score)
+                    env_ids = os.environ.get("EXL3_TAIL_HOLD_TOOL_IDS", "")
+                    if env_ids.strip():
+                        tool = {int(x) for x in env_ids.split(",") if x.strip()}
+                    else:
+                        from transformers import AutoTokenizer
+                        tok = AutoTokenizer.from_pretrained(self.model_config.tokenizer, trust_remote_code=self.model_config.trust_remote_code)
+                        tool = set()
+                        for t in ("</tool_call>", "<|im_end|>"):
+                            i = tok.convert_tokens_to_ids(t)
+                            if isinstance(i, int) and i >= 0 and i != tok.unk_token_id and t == "</tool_call>":
+                                tool.add(int(i))
+                    sh["tool_ids"] = tool
+                    logger.info("TAIL-HOLD: tool-call end token ids %s", sorted(tool))
+                except Exception as e:
+                    logger.warning("TAIL-HOLD: tool-call token ids unavailable (%r): holds ranked by age only", e)
+            else:
+                return
+        fwd = self.compilation_config.static_forward_context
+        groups = self.kv_cache_config.kv_cache_groups
+        zn = sh["zero_next"]
+        if zn:
+            items, zn[:] = list(zn), []
+            byg: dict = {}
+            for g, b in items:
+                byg.setdefault(g, []).append(b)
+            for g, bl in byg.items():
+                ib = torch.tensor(bl, dtype=torch.long, device=self.device)
+                for name in groups[g].layer_names:
+                    for t in fwd[name].kv_cache:
+                        t.index_fill_(0, ib, 0)
+        holds = getattr(scheduler_output, "llmt_tail_hold", None)
+        if not holds:
+            return
+        from exl3xpu.vllm_plugin import GDN_RC
+        gdn_recompute = torch.ops.exl3xpu_C.exl3_gdn_recompute
+        st = self.__dict__.setdefault("_th_stats", {"flushed": 0, "failed": 0})
+        last = getattr(self, "_th_last", {})
+        for rid, L, sblocks, nspec in holds:
+            ok, why = False, ""
+            try:
+                sl = getattr(self, "_rc_slot", {}).get(rid)
+                rec = last.get(rid)
+                if sl is None or rid not in getattr(self, "_rc_par", {}):
+                    why = "no pending slot"
+                elif rec is None or not rec[0]:
+                    why = "last step not speculative"
+                elif any(rec[1].get(g) != b for g, b in sblocks.items()):
+                    why = f"state block mismatch {rec[1]} vs {sblocks}"
+                else:
+                    par = self._rc_par[rid]
+                    dev = self.device
+                    if os.environ.get("EXL3_TAIL_HOLD_LOG", "0") == "1":
+                        rs_ = self.requests.get(rid)
+                        logger.info("TAIL-HOLD-FLUSH %s L %d nspec %d slot %d par %d rec %s sblocks %s computed %s "
+                                    "accepted_cpu %s step %d", rid, L, nspec, sl, par, rec, sblocks,
+                                    getattr(rs_, "num_computed_tokens", None),
+                                    (int(self.input_batch.num_accepted_tokens_cpu[self.input_batch.req_id_to_index[rid]])
+                                     if rid in self.input_batch.req_id_to_index else None), GDN_RC_STEP())
+                    idx = torch.tensor([[b, 1, sl, par, 0, 0] for b in sblocks.values()], dtype=torch.int32, device=dev)
+                    for gi, (g, b) in enumerate(sblocks.items()):
+                        sidx, npend, slot, pr, qsl = idx[gi, 0:1], idx[gi, 1:2], idx[gi, 2:3], idx[gi, 3:4], idx[gi, 4:6]
+                        for name in groups[g].layer_names:
+                            layer = fwd[name]
+                            pool = getattr(layer, "_exl3_pool", None)
+                            if pool is None:
+                                raise RuntimeError(f"no pending pool on {name}")
+                            H = layer.num_k_heads // layer.tp_size
+                            HV = layer.num_v_heads // layer.tp_size
+                            K, V = layer.head_k_dim, layer.head_v_dim
+                            key = (H, HV, K, V)
+                            dummy = self.__dict__.setdefault("_th_dummy", {}).get(key)
+                            if dummy is None:
+                                dummy = self._th_dummy[key] = (
+                                    torch.zeros((1, H, K), dtype=torch.float16, device=dev),
+                                    torch.zeros((1, H, K), dtype=torch.float16, device=dev),
+                                    torch.zeros((1, HV, V), dtype=torch.float16, device=dev),
+                                    torch.zeros((1, HV), dtype=torch.float32, device=dev),
+                                    torch.zeros((1, HV), dtype=torch.float32, device=dev),
+                                    torch.zeros((1, HV, V), dtype=torch.float16, device=dev))
+                            q_, k_, v_, g_, b_, o_ = dummy
+                            gdn_recompute(q_, k_, v_, g_, b_, o_, layer.kv_cache[1], sidx, *pool, npend, slot, pr, qsl,
+                                          GDN_RC.get("T1", 7), K ** -0.5)
+                    ok = True
+            except Exception as e:
+                why = repr(e)
+            if not ok:
+                st["failed"] += 1
+                if st["failed"] <= 20:
+                    logger.warning("TAIL-HOLD: flush failed for %s (%s): held state poisoned", rid, why)
+                try:
+                    for g, b in sblocks.items():
+                        for name in groups[g].layer_names:
+                            for t in fwd[name].kv_cache:
+                                t[b].fill_(float("nan"))
+                except Exception as e:
+                    logger.warning("TAIL-HOLD: poison failed for %s: %r", rid, e)
+            else:
+                st["flushed"] += 1
+            sh["flushed"][rid] = ok
+        if (st["flushed"] + st["failed"]) % 500 < len(holds):
+            logger.info("TAIL-HOLD: runner flushed %d, failed %d", st["flushed"], st["failed"])
 
     def initialize_kv_cache(
         self,

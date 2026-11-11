@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import os
 import time
 from collections import Counter, defaultdict, deque
@@ -3224,6 +3225,496 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+
+# ---- TAIL-HOLD ------------------------------------------------------------------------------------------------
+# Agent tool-call turns come back ~0.35 s after the previous turn finished and re-send its prompt + output + the tool
+# result. vLLM caches only full blocks (and, with --prefix-match-unit, the prompt end), so the previous OUTPUT is
+# recomputed every turn. EXL3_TAIL_HOLD=1: at a normal finish, keep (ref-count) the request's partial attention
+# block(s) and its committed GDN state block, record the token ids up to the resume point L, and let the next request
+# that extends exactly those tokens resume at L through upstream's partial-hit copy-on-write path.
+# GDN state (GDN recompute): after the last executed spec step the committed SSM state is at N (that step's first
+# position) and the step's tokens are pending. The runner (gpu_model_runner._llmt_tail_hold, start of _update_states,
+# before CoW copies run) applies ONE pending token -> SSM state at N + 1; the conv rows 0..2 already hold the window
+# ending at N + 1 (positions N-2, N-1, N). So L = N + 1:
+#   case A (no later step ran this request):  L = num_tokens - (tokens appended by the final step)
+#   case B (an async step after the finishing one still ran it; then the last step started at the old H): L = num_tokens
+# A failed flush poisons the held state (NaN -> NAN-PREEMPT recomputes the successor) and the block is zeroed on release.
+# Memory policy: holds never cost a running stream its KV: free-block watermark at admission and every step,
+# release everything and retry before any preemption, suspend holds after a preemption / KV wait (cooldown), never
+# hold while a preempted request waits. Inert unless EXL3_TAIL_HOLD=1 (and the runner in this process confirmed).
+# Requires the GDN recompute path in the model runner (EXL3_GDN_RECOMPUTE=1, EXL3 runtime plugin) and
+# mamba_cache_mode="align".
+_TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"
+_TH_TOOL_IDS = {int(x) for x in os.environ.get("EXL3_TAIL_HOLD_TOOL_IDS", "").split(",") if x.strip()}
+_TH_LOG = os.environ.get("EXL3_TAIL_HOLD_LOG", "0") == "1"     # one line per hold / hit (tests)
+# shared with the model runner (same process): runner_ok, flushed {rid: bool}, zero_next [(group_id, block_id)]
+_TH_SHARED: dict = {"runner_ok": False, "flushed": {}, "zero_next": []}
+
+
+
+def _tail_hold_release(entry, reason: str) -> None:
+    """Every hold release goes through here."""
+    entry["store"].release(entry, reason)
+
+
+class _TailHold:
+    MIN_TOKENS = int(os.environ.get("EXL3_TAIL_HOLD_MIN", "2048"))
+
+    def __init__(self, sched):
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+        self.s = sched
+        self.kvm = sched.kv_cache_manager
+        self.pool = self.kvm.block_pool
+        self.mgrs = list(self.kvm.coordinator.single_type_managers)
+        self.kind = []
+        for m in self.mgrs:
+            t = type(m)
+            self.kind.append("m" if t is MambaManager else "a" if t is FullAttentionManager else None)
+        self.usable = all(k is not None for k in self.kind) and "m" in self.kind
+        # Dry run on 621 recorded production finishes: tool-call finishes come back 81% of the
+        # time (gap p50 0.5 s, p90 12.6 s, p99 134 s), plain stops 4%; a flat 900 s pins 18 holds on average (~74 blocks),
+        # 60 s plain / 300 s tool-call keeps 316 of 317 hits with 5 live holds -> two TTLs by finish type.
+        self.ttl = float(os.environ.get("EXL3_TAIL_HOLD_S", "60"))
+        self.ttl_tool = float(os.environ.get("EXL3_TAIL_HOLD_TOOL_S", "300"))
+        self.max = int(os.environ.get("EXL3_TAIL_HOLD_MAX", "16"))
+        self.free_frac = float(os.environ.get("EXL3_TAIL_HOLD_FREE", "0.15"))
+        self.cool = float(os.environ.get("EXL3_TAIL_HOLD_COOLDOWN_S", "30"))
+        # Selective release: holds are ranked by expected reuse = (tool-call finish ? 2 : 1) * exp(-age / decay); memory pressure
+        # releases the lowest-ranked holds one at a time instead of all of them (production replay: 27 of 92 holds were
+        # dropped by the preempt guard before their follow-up arrived). Tool-call end token ids come from the runner
+        # (_TH_SHARED["tool_ids"], resolved from the tokenizer) or EXL3_TAIL_HOLD_TOOL_IDS.
+        self.decay = float(os.environ.get("EXL3_TAIL_HOLD_DECAY_S", "60"))
+        # ARC-like split: a conversation whose hold was resumed before (T2) outranks one
+        # never resumed (T1); keyed by the conversation's first block hash, bounded
+        self.conv_hit: dict = {}
+        self.entries: dict = {}            # rid -> entry, insertion order = age
+        self.notices: list = []
+        self.seq = 0                       # non-empty steps scheduled
+        self.done = 0                      # non-empty steps whose output was processed (FIFO)
+        self.last: dict = {}               # rid -> (seq, num spec tokens, num scheduled tokens) of its last scheduled step
+        self.suspend_until = 0.0
+        self.st = dict(held=0, hits=0, saved=0, expired=0, released_hit=0, released_memory=0, released_watermark=0,
+                       released_preempt_guard=0, released_reset=0, released_expired=0, released_cap=0,
+                       flush_fail=0, suspended_steps=0, preemptions_avoided=0, skip_watermark=0, skip_suspended=0,
+                       skip_other=0, guard_kept=0, guard_events=0,
+                       tier_wins=0, tier_deferred=0, tail_over_tier=0)
+        self._next_log = 500
+        logger.info("TAIL-HOLD: on (usable %s, groups %s, ttl %.0f s / tool-call %.0f s, max %d, free watermark %.0f%%, cooldown %.0f s)",
+                    self.usable, "".join(k or "?" for k in self.kind), self.ttl, self.ttl_tool, self.max, 100 * self.free_frac,
+                    self.cool)
+
+    # ---- memory policy
+    def score(self, e, now: float | None = None) -> float:
+        """expected reuse of a hold: agents come back within seconds after a tool call, rarely after a final answer"""
+        now = time.monotonic() if now is None else now
+        return ((2.0 if e.get("tool") else 1.0) * (1.5 if e.get("t2") else 1.0)
+                * math.exp(-max(0.0, now - e["t"]) / max(1.0, self.decay)))
+
+    def ranked(self) -> list:
+        """holds from least to most valuable (release order)"""
+        now = time.monotonic()
+        return sorted(self.entries.values(), key=lambda e: self.score(e, now))
+
+    def _reserve(self) -> int:
+        return len(self.s.running) * len(self.mgrs)          # next-step growth: +1 block per group per running request
+
+    def _below_watermark(self, extra: int = 0) -> bool:
+        free = self.pool.get_num_free_blocks()
+        return free - extra - self._reserve() < self.free_frac * self.pool.num_gpu_blocks
+
+    def _preempted_waiting(self) -> bool:
+        try:
+            for q in (self.s.waiting, self.s.skipped_waiting):
+                for r in q:
+                    if r.status == RequestStatus.PREEMPTED or r.num_preemptions > 0:
+                        return True
+        except Exception:
+            return True
+        return False
+
+    def suspend(self, reason: str) -> None:
+        self.release_all(reason)
+        self.suspend_until = time.monotonic() + self.cool
+
+    def release_all(self, reason: str) -> None:
+        for e in list(self.entries.values()):
+            _tail_hold_release(e, reason)
+
+    def release(self, e, reason: str) -> None:
+        self.entries.pop(e["rid"], None)
+        if e.get("released"):
+            return
+        e["released"] = True
+        e["release_reason"] = reason
+        fl = _TH_SHARED["flushed"].pop(e["rid"], None)
+        e["flushed"] = fl
+        if fl is False:       # poisoned by the runner: zero the state blocks before anyone else gets them
+            _TH_SHARED["zero_next"].extend(e["state_blocks"].items())
+        self.pool.free_blocks(e["pins"])
+        self.st["released_" + reason] = self.st.get("released_" + reason, 0) + 1
+        if _TH_LOG and reason != "hit":
+            logger.info("TAIL-HOLD: release %s (%s, flushed %s)", e["rid"], reason, fl)
+
+    def before_schedule(self) -> None:
+        now = time.monotonic()
+        if now < self.suspend_until:
+            self.st["suspended_steps"] += 1
+        if not self.entries:
+            return
+        for e in list(self.entries.values()):
+            if now - e["t"] > (self.ttl_tool if e.get("tool") else self.ttl) and e["claim"] is None:
+                self.st["expired"] += 1
+                _tail_hold_release(e, "expired")
+        if self._preempted_waiting():
+            self.suspend("preempt_guard")
+            return
+        for e in self.ranked():
+            if not self._below_watermark():
+                break
+            _tail_hold_release(e, "watermark")
+
+    # ---- bookkeeping
+    def after_schedule(self, out) -> None:
+        if out.total_num_scheduled_tokens > 0:
+            self.seq += 1
+            spec = out.scheduled_spec_decode_tokens
+            for rid, q in out.num_scheduled_tokens.items():
+                self.last[rid] = (self.seq, len(spec.get(rid, ())), q)
+        if self.notices:
+            out.llmt_tail_hold = self.notices
+            self.notices = []
+        if self.st["held"] >= self._next_log:
+            self._next_log += 20 if _TH_LOG else 500
+            logger.info("TAIL-HOLD: %s, live %d", self.st, len(self.entries))
+
+    # ---- create
+    def maybe_hold(self, req) -> None:
+        """With EXL3_TAIL_HOLD_LOG=1, log why a finished request did NOT get a hold (the counters alone are only logged
+        every 500 holds)."""
+        if not _TH_LOG:
+            return self._maybe_hold(req)
+        fin = req.__dict__.get("_th_fin")
+        last = self.last.get(req.request_id)
+        before = dict(self.st)
+        self._maybe_hold(req)
+        if self.st["held"] == before["held"]:
+            why = [k for k in self.st if self.st[k] != before.get(k)] or ["early"]
+            logger.info("TAIL-HOLD: no hold %s: %s status=%s fin=%s last=%s done=%d T=%d out=%d", req.request_id, ",".join(why),
+                        getattr(req.status, "name", req.status), fin, last, self.done, req.num_tokens, req.num_output_tokens)
+
+    def _maybe_hold(self, req) -> None:
+        rid = req.request_id
+        last = self.last.pop(rid, None)
+        fin = req.__dict__.pop("_th_fin", None)
+        if not self.usable or not _TH_SHARED["runner_ok"]:
+            return
+        if req.status not in (RequestStatus.FINISHED_STOPPED, RequestStatus.FINISHED_LENGTH_CAPPED):
+            return
+        if fin is None or fin[0] != self.done or last is None:
+            return
+        if time.monotonic() < self.suspend_until or self._preempted_waiting():
+            self.st["skip_suspended"] += 1
+            return
+        if getattr(req, "mm_features", None) or getattr(req, "prompt_embeds", None) is not None:
+            return
+        _, a_pre, j = fin
+        lseq, nspec, q = last
+        if nspec < 1 or q != 1 + nspec:
+            self.st["skip_other"] += 1
+            return
+        T = req.num_tokens
+        if lseq > self.done:              # case B: an async step after the finishing one ran this request
+            if j != a_pre:
+                self.st["skip_other"] += 1
+                return
+            L = T
+        else:                             # case A
+            L = T - j
+        if L < self.MIN_TOKENS or L > T:
+            return
+        groups, pins, sblocks = [], [], {}
+        for m, k in zip(self.mgrs, self.kind):
+            blocks = m.req_to_blocks.get(rid) or []
+            bs = m.block_size
+            if k == "m":
+                idx = (L - 1 + nspec) // bs
+                if idx >= len(blocks) or blocks[idx].is_null:
+                    self.st["skip_other"] += 1
+                    return
+                groups.append(("m", blocks[idx], (L - 1) // bs))
+                pins.append(blocks[idx])
+                sblocks[m.kv_cache_group_id] = blocks[idx].block_id
+            else:
+                n = cdiv(L, bs)
+                if n > len(blocks):
+                    self.st["skip_other"] += 1
+                    return
+                lst = []
+                for i in range(n):
+                    b = blocks[i]
+                    if b.is_null:
+                        self.st["skip_other"] += 1
+                        return
+                    if (i + 1) * bs <= L and b.block_hash is not None:
+                        lst.append((b, b.block_hash, False))
+                    else:
+                        lst.append((b, None, True))
+                        pins.append(b)
+                groups.append(("a", lst, m.kv_cache_group_id))
+        if self._below_watermark(len(pins)):
+            self.st["skip_watermark"] += 1
+            return
+        while len(self.entries) >= self.max:
+            _tail_hold_release(self.ranked()[0], "cap")
+        for b in pins:
+            b.ref_cnt += 1                # still owned by the finishing request, so not in the free queue
+        hbs = self.pool.hash_block_size
+        tool_ids = _TH_SHARED.get("tool_ids") or _TH_TOOL_IDS
+        tool = bool(tool_ids) and any(int(t) in tool_ids for t in req.all_token_ids[max(0, L - 12):L])
+        conv = req.block_hashes[0] if req.block_hashes else None
+        e = dict(store=self, rid=rid, L=L, t=time.monotonic(), claim=None, case="B" if lseq > self.done else "A", tool=tool,
+                 conv=conv, t2=conv is not None and conv in self.conv_hit,
+                 tokens=np.asarray(req.all_token_ids[:L], dtype=np.int32),
+                 block_hashes=list(req.block_hashes[: L // hbs]), hash_block_size=hbs,
+                 groups=groups, pins=pins, state_blocks=sblocks,
+                 block_ids={m.kv_cache_group_id: [b.block_id for b in (m.req_to_blocks.get(rid) or [])[:cdiv(L, m.block_size)]]
+                            for m in self.mgrs},
+                 flushed=None)
+        self.entries[rid] = e
+        self.notices.append((rid, L, sblocks, nspec))
+        self.st["held"] += 1
+        if _TH_LOG:
+            logger.info("TAIL-HOLD: hold %s L %d case %s pins %d state %s tool %s", rid, L, e["case"], len(pins), sblocks, tool)
+
+    # ---- use
+    def match(self, req, hit: int):
+        if (not self.entries or getattr(req, "mm_features", None) or req.skip_reading_prefix_cache
+                or getattr(req, "prompt_embeds", None) is not None):
+            return None
+        bh = req.block_hashes
+        T = req.num_tokens
+        # EXL3_TAIL_MIN_REUSE_TOKENS=N (default 0 = off): skip a hold whose reuse past the last full block (L - full-block
+        # floor of L) is shorter than N tokens, i.e. take the normal block-aligned hit and recompute those tokens. The
+        # in-VRAM hold is zero-copy, so this is only a cutoff hook for holds that would have to be copied in.
+        _tmin = int(os.environ.get("EXL3_TAIL_MIN_REUSE_TOKENS", "0") or 0)
+        for e in reversed(list(self.entries.values())):
+            L = e["L"]
+            if L <= hit or L > T - 1 or e["claim"] not in (None, req.request_id):
+                continue
+            if _tmin and (L - (L // self.pool.hash_block_size) * self.pool.hash_block_size) < _tmin \
+                    and (L // self.pool.hash_block_size) * self.pool.hash_block_size <= hit:
+                continue
+            if _TH_SHARED["flushed"].get(e["rid"]) is False:
+                continue
+            hbs = e["hash_block_size"]
+            u = L // hbs
+            if u == 0 or u > len(bh) or bh[u - 1] != e["block_hashes"][u - 1]:
+                continue
+            if list(req.all_token_ids[u * hbs:L]) != e["tokens"][u * hbs:L].tolist():
+                continue
+            ok = True
+            out = []
+            for g in e["groups"]:
+                if g[0] == "m":
+                    out.append([self.pool.null_block] * g[2] + [g[1]])
+                else:
+                    for b, h, held in g[1]:
+                        if not held and (b.block_hash != h or b.is_null):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                    out.append([b for b, _, _ in g[1]])
+            if not ok:
+                continue
+            e["claim"] = req.request_id
+            e["claim_hit"] = hit
+            return self.kvm.create_kv_cache_blocks(tuple(out)), L, 0
+        return None
+
+    def claimed_by(self, rid):
+        for e in self.entries.values():
+            if e["claim"] == rid:
+                return e
+        return None
+
+
+if _TAIL_HOLD:
+    import numpy as np
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.core.kv_cache_manager import KVCacheManager as _THKVM
+
+    def _th_of(obj):
+        return getattr(obj, "_llmt_th", None)
+
+    _th_orig_init = Scheduler.__init__
+
+    def _th_init(self, *a, **kw):
+        _th_orig_init(self, *a, **kw)
+        try:
+            if self.cache_config.enable_prefix_caching and self.has_mamba_layers:
+                self._llmt_th = _TailHold(self)
+                self.kv_cache_manager._llmt_th = self._llmt_th
+                if self.connector is not None:
+                    # TIER-VS-TAIL: a request that took a tail hit gets no external tokens (its local hit is mid-block,
+                    # which the connector cannot load on top of); the tier was already consulted on the normal hit.
+                    th = self._llmt_th
+                    th._conn_orig_lookup = self.connector.get_num_new_matched_tokens
+
+                    def _th_conn_lookup(request, num_computed_tokens, _th=th):
+                        if _th.entries and _th.claimed_by(request.request_id) is not None:
+                            return 0, False
+                        return _th._conn_orig_lookup(request, num_computed_tokens)
+                    self.connector.get_num_new_matched_tokens = _th_conn_lookup
+                    logger.info("TAIL-HOLD: connector lookup wrapped (tier vs tail)")
+            else:
+                logger.info("TAIL-HOLD: requested but prefix caching / mamba layers are off: not installed")
+        except Exception as e:
+            logger.warning("TAIL-HOLD: not installed: %r", e)
+    Scheduler.__init__ = _th_init
+
+    _th_orig_schedule = Scheduler.schedule
+
+    def _th_schedule(self, *a, **kw):
+        th = _th_of(self)
+        if th is not None:
+            try:
+                th.before_schedule()
+            except Exception as e:
+                logger.warning("TAIL-HOLD: before_schedule failed: %r", e)
+        out = _th_orig_schedule(self, *a, **kw)
+        if th is not None:
+            try:
+                th.after_schedule(out)
+            except Exception as e:
+                logger.warning("TAIL-HOLD: after_schedule failed: %r", e)
+        return out
+    Scheduler.schedule = _th_schedule
+
+    _th_orig_ufo = Scheduler.update_from_output
+
+    def _th_update_from_output(self, scheduler_output, *a, **kw):
+        th = _th_of(self)
+        if th is not None and scheduler_output.total_num_scheduled_tokens > 0:
+            th.done += 1
+        return _th_orig_ufo(self, scheduler_output, *a, **kw)
+    Scheduler.update_from_output = _th_update_from_output
+
+    _th_orig_urwo = Scheduler._update_request_with_output
+
+    def _th_update_request_with_output(self, request, new_token_ids):
+        th = _th_of(self)
+        a_pre = len(new_token_ids)
+        new_token_ids, stopped = _th_orig_urwo(self, request, new_token_ids)
+        if th is not None and stopped:
+            request._th_fin = (th.done, a_pre, len(new_token_ids))
+        return new_token_ids, stopped
+    Scheduler._update_request_with_output = _th_update_request_with_output
+
+    _th_orig_free_request = Scheduler._free_request
+
+    def _th_free_request(self, request, *a, **kw):
+        th = _th_of(self)
+        if th is not None:
+            try:
+                th.maybe_hold(request)
+            except Exception as e:
+                logger.warning("TAIL-HOLD: hold failed: %r", e)
+        return _th_orig_free_request(self, request, *a, **kw)
+    Scheduler._free_request = _th_free_request
+
+    _th_orig_preempt = Scheduler._preempt_request
+
+    def _th_preempt_request(self, request, *a, **kw):
+        th = _th_of(self)
+        if th is not None:
+            th.suspend("preempt_guard")
+        return _th_orig_preempt(self, request, *a, **kw)
+    Scheduler._preempt_request = _th_preempt_request
+
+    _th_orig_reset = Scheduler.reset_prefix_cache
+
+    def _th_reset_prefix_cache(self, *a, **kw):
+        th = _th_of(self)
+        if th is not None:
+            th.release_all("reset")
+        return _th_orig_reset(self, *a, **kw)
+    Scheduler.reset_prefix_cache = _th_reset_prefix_cache
+
+    _th_orig_gcb = _THKVM.get_computed_blocks
+
+    def _th_get_computed_blocks(self, request):
+        res = _th_orig_gcb(self, request)
+        th = _th_of(self)
+        if th is not None and th.entries:
+            try:
+                m = th.match(request, res[1])
+                if m is not None:
+                    # TIER-VS-TAIL: a tail hit ends mid-block, and the offloading connector
+                    # asserts that the local hit is block-aligned when it has external tokens to load on top
+                    # (update_state_after_alloc). The two never combine: ask the tier what it has beyond the NORMAL
+                    # (block-aligned) hit; if that reaches the tail's L (the continuation was computed before: a rerun
+                    # or another engine sharing the CPU tier), the tier wins and the claim is dropped; otherwise the tail wins and the
+                    # scheduler's own connector lookup for this request is answered with 0 (see _th_conn_lookup).
+                    conn = getattr(th.s, "connector", None)
+                    if conn is not None:
+                        ext, _ = th._conn_orig_lookup(request, res[1])
+                        if ext is None or res[1] + ext >= m[1]:
+                            e = th.claimed_by(request.request_id)
+                            if e is not None:
+                                e["claim"] = None
+                                e.pop("claim_hit", None)
+                            th.st["tier_wins" if ext is not None else "tier_deferred"] += 1
+                            if _TH_LOG:
+                                logger.info("TAIL-HOLD: tier wins for %s: normal hit %d + tier %s >= tail %d",
+                                            request.request_id, res[1], ext, m[1])
+                            return res
+                        if ext:
+                            th.st["tail_over_tier"] += 1
+                    return m
+            except Exception as e:
+                logger.warning("TAIL-HOLD: match failed: %r", e)
+        return res
+    _THKVM.get_computed_blocks = _th_get_computed_blocks
+
+    _th_orig_alloc = _THKVM.allocate_slots
+
+    def _th_allocate_slots(self, request, *a, **kw):
+        res = _th_orig_alloc(self, request, *a, **kw)
+        th = _th_of(self)
+        if th is None:
+            return res
+        if res is None and th.entries:
+            # preemption guard: holds go first (least valuable first, one at a time, retrying the allocation after each);
+            # preempt only if it still does not fit with every hold gone
+            th.st["guard_events"] += 1
+            for e in th.ranked():
+                _tail_hold_release(e, "preempt_guard")
+                res = _th_orig_alloc(self, request, *a, **kw)
+                if res is not None:
+                    th.st["preemptions_avoided"] += 1
+                    th.st["guard_kept"] += len(th.entries)
+                    break
+        if res is None:
+            th.suspend("preempt_guard")        # a running request is about to be preempted or a new one waits for KV
+            return res
+        e = th.claimed_by(request.request_id)
+        if e is not None:
+            th.st["hits"] += 1
+            th.st["saved"] += e["L"] - e.get("claim_hit", 0)
+            if e.get("conv") is not None:
+                th.conv_hit[e["conv"]] = time.monotonic()
+                if len(th.conv_hit) > 4096:
+                    for k in sorted(th.conv_hit, key=th.conv_hit.get)[:1024]:
+                        th.conv_hit.pop(k, None)
+            if _TH_LOG:
+                logger.info("TAIL-HOLD: hit %s <- %s at %d (normal hit %d)", request.request_id, e["rid"], e["L"],
+                            e.get("claim_hit", 0))
+            _tail_hold_release(e, "hit")
+        return res
+    _THKVM.allocate_slots = _th_allocate_slots
+    logger.info("TAIL-HOLD: scheduler hooks installed (EXL3_TAIL_HOLD=1)")
 
 
 # MAMBA-RETENTION: with sparse Mamba/GDN state retention in the GPU prefix cache (upstream's
