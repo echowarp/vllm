@@ -250,6 +250,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_MAMBA_ACC_FIX = os.environ.get("EXL3_MAMBA_ACC_FIX", "1") == "1"  # MAMBA-ACC (see execute_model)
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -4370,6 +4372,32 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
+                # MAMBA-ACC: num_accepted_tokens only means something for a request whose previous step was a
+                # speculative decode. A request in prefill could inherit another request's count when the batch
+                # was condensed (async row remap + non-blocking D2H of the counts), and preprocess_mamba then
+                # copied its state with offset accepted-1: conv rows prefill never writes, SSM from block
+                # prev+accepted-1 (its own fresh, never-written block) -> stale/NaN state. EXL3_MAMBA_ACC_FIX=0
+                # disables (the GDN recompute path relies on _llmt_prev_spec_reqs, set here).
+                if _MAMBA_ACC_FIX:
+                    _prev_spec = getattr(self, "_llmt_prev_spec_reqs", set())
+                    for _i, _rid in enumerate(self.input_batch.req_ids):
+                        if _rid not in _prev_spec and self.input_batch.num_accepted_tokens_cpu[_i] != 1:
+                            self._llmt_acc_fixes = getattr(self, "_llmt_acc_fixes", 0) + 1
+                            if self._llmt_acc_fixes <= 20 or self._llmt_acc_fixes % 1000 == 0:
+                                logger.warning("MAMBA-ACC: request %s had num_accepted_tokens %d without a speculative "
+                                               "step before (computed %d); reset to 1 (%d fixes so far)", _rid,
+                                               int(self.input_batch.num_accepted_tokens_cpu[_i]),
+                                               self.requests[_rid].num_computed_tokens, self._llmt_acc_fixes)
+                            self.input_batch.num_accepted_tokens_cpu[_i] = 1
+                    self._llmt_prev_spec_reqs = set(scheduler_output.scheduled_spec_decode_tokens.keys())
+                # MAMBA-IDX: a request at 0 computed tokens (recompute after NAN-PREEMPT or a preemption,
+                # whose in-flight async step re-set the index) has no previous state; a leftover index made
+                # preprocess_mamba copy from a stale/null block.
+                for _rid in self.input_batch.req_ids:
+                    _rs = self.requests.get(_rid)
+                    if _rs is not None and _rs.num_computed_tokens == 0 and _rid in self.mamba_state_idx:
+                        logger.info("MAMBA-IDX: dropped stale state index %d of request %s (0 computed tokens)",
+                                    self.mamba_state_idx.pop(_rid), _rid)
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
                     self.kv_cache_config,
