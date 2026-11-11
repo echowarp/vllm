@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import multiprocessing
+import os
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -430,18 +431,30 @@ class StructuredOutputManager:
             # same-step exception: they model phased output (e.g. thinking tag ->
             # answer tag), and speculative decoding must run grammar.validate_tokens
             # on draft tokens produced immediately after that transition.
-            if (
-                self.vllm_config.speculative_config is not None
-                and structured_req.structured_output_key[0]
+            # With speculative decoding, the draft tokens accepted after the end marker in
+            # this step were already bitmasked by grammar_bitmask() (mid-window detection). Deferring the advance
+            # dropped them, so the grammar restarted and allowed a second '{' ('{{"summary": ...}'). Trim the
+            # reasoning part and advance through the rest for every structured-output type, not only structural
+            # tags. EXL3_SO_SAMESTEP=0 restores upstream.
+            if self.vllm_config.speculative_config is not None and (
+                os.environ.get("EXL3_SO_SAMESTEP", "1") == "1"
+                or structured_req.structured_output_key[0]
                 == StructuredOutputOptions.STRUCTURAL_TAG
             ):
                 # The scheduler will advance the grammar with this step's
                 # tokens right away, but the step still contains reasoning
                 # content up to and including the end marker. Record where
                 # it ends so trim_reasoning_for_advance() can drop it.
-                structured_req.reasoning_end_token_index = (
-                    self._find_reasoning_end_index(reasoner, all_token_ids, start)
-                )
+                # Under async scheduling ``start`` (num_computed_tokens - num_output_placeholders)
+                # can point past this step's first token, and the qwen3 parser's streaming check scans the whole
+                # history, so the search fired one token late and trimmed the first grammar token ('{'). Resolve
+                # the index in trim_reasoning_for_advance(), which knows this step's tokens.
+                if os.environ.get("EXL3_SO_SAMESTEP", "1") == "1":
+                    structured_req.reasoning_end_token_index = -1
+                else:
+                    structured_req.reasoning_end_token_index = (
+                        self._find_reasoning_end_index(reasoner, all_token_ids, start)
+                    )
                 return True
 
         return False
@@ -488,6 +501,11 @@ class StructuredOutputManager:
         if end_idx is None:
             return new_token_ids
         first_idx = len(request.all_token_ids) - len(new_token_ids)
+        if end_idx == -1:  # set by should_advance in this step
+            reasoner = self._get_reasoner(request)
+            assert reasoner is not None
+            end_idx = self._find_reasoning_end_index(reasoner, request.all_token_ids, first_idx)
+            structured_req.reasoning_end_token_index = end_idx
         num_reasoning = end_idx + 1 - first_idx
         if num_reasoning <= 0:
             return new_token_ids
