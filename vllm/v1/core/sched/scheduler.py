@@ -3,7 +3,7 @@
 import itertools
 import os
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
@@ -70,6 +70,50 @@ logger = init_logger(__name__)
 # EXL3_HYBRID_CONN_LOOKUP=upstream restores upstream's per-group prefix lookup for hybrid (Mamba) models with a KV
 # connector; see schedule().
 _HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
+
+
+# GPU-EVICT-ORDER: EXL3_GPU_EVICT_ORDER=chain returns a finished hybrid request's blocks to the free queue
+# position-interleaved across all KV groups (block i of every group, i ascending) instead of group by group.
+# vLLM's coordinator returns them group by group (attention, then each Mamba/GDN state group) and frees that list
+# reversed, so a request's state pages enter the free queue (= eviction order) ahead of all its attention blocks. A
+# few dozen evictions then take every state a session has; a GPU hit needs attention blocks AND a state at the hit
+# point, so the session's whole GPU prefix becomes useless (seen with two long agent sessions sharing a pool: each
+# turn of one session evicted the other's states, 87k-156k tokens recomputed per turn). With chain order the reversed
+# free order is "deepest position first, all groups together": eviction peels a session from its end, and what is
+# left is a prefix [0, k) whose retained states below k still serve hits; the colder session is consumed before any
+# block of the warmer one. Default (unset) = vLLM's order.
+def _interleave_blocks(lists):
+    """per-group block lists (allocation order, index = block position) -> position-major, groups in order"""
+    out = []
+    for i in range(max((len(x) for x in lists), default=0)):
+        for x in lists:
+            if i < len(x):
+                out.append(x[i])
+    return out
+
+
+def _install_chain_free_order(kvm):
+    coord = getattr(kvm, "coordinator", None)
+    mgrs = list(getattr(coord, "single_type_managers", ()) or ())
+    if len(mgrs) < 2 or len({m.block_size for m in mgrs}) != 1:
+        logger.warning("GPU-EVICT-ORDER: needs >= 2 KV groups with one block size: not installed")
+        return None
+    n = Counter()
+
+    def pop_blocks_for_free(request):
+        rid = request.request_id
+        blocks = _interleave_blocks([m.pop_blocks_for_free(rid) for m in mgrs])
+        n["requests"] += 1
+        return blocks
+
+    def free(request):
+        kvm.block_pool.free_blocks(reversed(pop_blocks_for_free(request)))
+
+    kvm.pop_blocks_for_free, kvm.free = pop_blocks_for_free, free
+    kvm._gpu_evict_order = n
+    logger.info("GPU-EVICT-ORDER: chain (a finished request's blocks enter the eviction order deepest position first, "
+                "all %d KV groups together)", len(mgrs))
+    return n
 
 
 class Scheduler(SchedulerInterface):
@@ -308,6 +352,8 @@ class Scheduler(SchedulerInterface):
             _cs = getattr(self.connector, "connector_scheduler", None)
             if _cs is not None:
                 _cs._llmt_block_pool = self.kv_cache_manager.block_pool
+        if os.environ.get("EXL3_GPU_EVICT_ORDER", "") == "chain":
+            _install_chain_free_order(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
