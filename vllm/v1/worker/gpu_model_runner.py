@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -254,6 +255,33 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _nan_guard_collect(pending) -> tuple[dict[str, int], dict[str, list[int]]]:
+    """NAN-GUARD: map a step's host-synced per-row NaN/inf flags to requests.
+    Returns ({req_id: bad rows}, {req_id: [flag per sampled position]}) for the bad requests only."""
+    if pending is None:
+        return {}, {}
+    buf, n, req_ids, counts = pending
+    flags = buf[:n].tolist()
+    nans: dict[str, int] = {}
+    rowflags: dict[str, list[int]] = {}
+    i = 0
+    for req_id, c in zip(req_ids, counts):
+        seg = flags[i:i + c]
+        i += c
+        bad = sum(1 for f in seg if f)
+        if bad:
+            nans[req_id] = bad
+            rowflags[req_id] = seg
+    if i != n:
+        logger.warning("NAN-ROWS: row layout mismatch (%d rows, %d mapped); flags=%s", n, i, flags)
+    if nans:
+        layout = {}; _o = 0
+        for _r, _c in zip(req_ids, counts):
+            layout[_r[-8:]] = (_o, _c); _o += _c
+        logger.warning("NAN-ROWS: NaN/+inf logit rows (1=NaN, 2=+inf per sampled position): %s; batch layout {req: (first_row, rows)} %s, rows %d", rowflags, layout, n)
+    return nans, rowflags
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -266,6 +294,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        nan_guard_pending=None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -281,6 +310,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
         self._has_fault: torch.Tensor | None = None
+        self._nan_guard_pending = nan_guard_pending  # NAN-GUARD flags of this step
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -331,6 +361,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             )
 
         output = self._model_runner_output
+        if self._nan_guard_pending is not None:  # NAN-GUARD (copy covered by the event above)
+            nans, _ = _nan_guard_collect(self._nan_guard_pending)
+            self._nan_guard_pending = None
+            if nans:
+                output.num_nans_in_logits = {**(output.num_nans_in_logits or {}), **nans}
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
 
@@ -3634,11 +3669,76 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _nan_guard(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: "SpecDecodeMetadata | None" = None,
+    ) -> torch.Tensor | None:
+        """NAN-GUARD (EXL3_NAN_GUARD, default on): NaN/+inf logit rows are neutralised and reported
+        per request.
+
+        Rows with NaN/+inf are forced to end-of-turn (without the scheduler's NAN-PREEMPT the request
+        just stops). The per-row flags (1 = NaN, 2 = +inf) go to a pinned ring buffer with a
+        non-blocking copy, so no extra device sync; `_nan_guard_collect` maps them to requests once
+        the step's outputs are on the host and fills `num_nans_in_logits`, which the scheduler's
+        NAN-PREEMPT path uses to discard the step, drop the request's cached state and re-queue it
+        for recompute. Logged here as "NAN-ROWS:"; the scheduler logs "NAN-PREEMPT:" (recovered) or
+        "NAN-GUARD:" (gave up). -inf (grammar masks) is fine.
+        """
+        if logits is None or not getattr(self, "_nan_guard_on", True):
+            return logits
+        if not hasattr(self, "_nan_guard_eos"):
+            self._nan_guard_on = os.environ.get("EXL3_NAN_GUARD", "1") != "0"
+            eos = None
+            try:
+                from vllm.transformers_utils.config import try_get_generation_config
+                gen_cfg = try_get_generation_config(self.model_config.model, self.model_config.trust_remote_code)
+                eos = getattr(gen_cfg, "eos_token_id", None) if gen_cfg is not None else None
+            except Exception:
+                pass
+            if eos is None:
+                eos = getattr(self.model_config.hf_text_config, "eos_token_id", None)
+            self._nan_guard_eos = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
+            rows = max(1, int(self.max_num_reqs) * (int(self.num_spec_tokens) + 1))
+            self._nan_guard_ring = [torch.zeros(rows, dtype=torch.uint8, pin_memory=True) for _ in range(8)]
+            self._nan_guard_ring_i = 0
+            self._nan_guard_pending = None
+            logger.info("NAN-GUARD on: NaN/+inf logit rows are forced to token %d and reported per "
+                        "request (scheduler NAN-PREEMPT decides)", self._nan_guard_eos)
+            if not self._nan_guard_on:
+                return logits
+        # One reduction: NaN and +inf both propagate through amax; -inf grammar masks don't.
+        row_max = logits.amax(dim=-1)
+        nan = torch.isnan(row_max)
+        inf = torch.isposinf(row_max)
+        bad = nan | inf
+        n = int(logits.shape[0])
+        buf = self._nan_guard_ring[self._nan_guard_ring_i]
+        self._nan_guard_ring_i = (self._nan_guard_ring_i + 1) % len(self._nan_guard_ring)
+        if n > buf.shape[0]:
+            buf = torch.zeros(n, dtype=torch.uint8, pin_memory=True)
+        buf[:n].copy_(nan.to(torch.uint8) + inf.to(torch.uint8) * 2, non_blocking=True)
+        if spec_decode_metadata is not None:
+            counts = [int(d) + 1 for d in spec_decode_metadata.num_draft_tokens]
+        else:
+            counts = [1] * len(self.input_batch.req_ids)
+        self._nan_guard_pending = (buf, n, list(self.input_batch.req_ids), counts)
+        eos_col = logits[:, self._nan_guard_eos].clone()
+        logits.masked_fill_(bad.unsqueeze(-1), float("-inf"))
+        logits[:, self._nan_guard_eos] = torch.where(bad, torch.zeros_like(eos_col), eos_col)
+        return logits
+
+    def _nan_guard_take_pending(self):
+        p = getattr(self, "_nan_guard_pending", None)
+        self._nan_guard_pending = None
+        return p
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        logits = self._nan_guard(logits, spec_decode_metadata)
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
@@ -4733,6 +4833,12 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            pending = self._nan_guard_take_pending()  # NAN-GUARD (sync path)
+            if pending is not None:
+                torch.cuda.current_stream().synchronize()
+                nans, _ = _nan_guard_collect(pending)
+                if nans:
+                    output.num_nans_in_logits = {**(output.num_nans_in_logits or {}), **nans}
             return output
 
         with record_function_or_nullcontext(
@@ -4770,6 +4876,7 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                nan_guard_pending=self._nan_guard_take_pending(),
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
