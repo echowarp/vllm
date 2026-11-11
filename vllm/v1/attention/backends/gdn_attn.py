@@ -209,8 +209,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
         if spec_sequence_masks is None:
+            # A request still prefilling its prompt with a 1-token query (a 1-token prompt, or the last token of a
+            # chunked prompt) was classified as a decode; the decode kernels read the request's GDN/conv state without
+            # an initial-state mask, and a fresh request has none (NaN logits). Count such rows as prefills.
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m, decode_threshold=1,
+                    treat_short_extends_as_decodes=getattr(m, "is_prefilling", None) is None,
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
