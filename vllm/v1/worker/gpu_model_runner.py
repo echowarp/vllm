@@ -5803,23 +5803,25 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt scores respecting logprobs_mode.
-            # NOTE: prompt tokens skip sampling processors, so
-            # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
-            else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
+            # Compute the prompt logits in slices of 64 rows. One call over a whole prompt chunk sent a
+            # quantized LM head (248k vocab) down its large-M path (full-vocab dequantized weight + GEMM
+            # output, ~2 GB beyond the profiled budget) and ran the engine out of device memory. 64 rows
+            # stay on the small-M path (same head math as sampling), bounded memory.
+            parts = []
+            for s0 in range(0, num_logits, 64):
+                logits = self.model.compute_logits(prompt_hidden_states[s0 : s0 + 64])
+                # NOTE: prompt tokens skip sampling processors, so processed_* and raw_* yield the same scores here.
+                if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
+                    scores = logits.to(torch.float32)
+                else:
+                    scores = self.sampler.compute_logprobs(logits)
+                parts.append(self.sampler.gather_logprobs(scores, num_prompt_logprobs, tgt_token_ids[s0 : s0 + 64])[:3])
+                del logits, scores
+            token_ids, logprobs, ranks = (torch.cat(t) for t in zip(*parts))
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)
