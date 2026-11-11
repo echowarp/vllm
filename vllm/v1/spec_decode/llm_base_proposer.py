@@ -1830,6 +1830,7 @@ class SpecDecodeBaseProposer:
 # target p is cut to the request's top-k / top-p, so draft mass outside p's nucleus is always rejected. Sampling the
 # draft from q truncated + renormalized the same way (and passing that q' as draft_probs) keeps rejection sampling
 # exact and raises the overlap sum(min(p, q')). flashinfer softmax -> top_k_renorm -> top_p_renorm. EXL3_DRAFT_TOPKP=1.
+_EXL3_FAST_DRAFT_SAMPLE = os.environ.get("EXL3_FAST_DRAFT_SAMPLE", "1") == "1"
 _EXL3_DRAFT_TOPKP = os.environ.get("EXL3_DRAFT_TOPKP", "0") == "1"
 
 
@@ -1878,6 +1879,22 @@ def compute_probs_and_sample_next_token(
         r = _exl3_draft_topkp(logits, sampling_metadata)
         if r is not None:
             return r
+    # Fused draft sampling (optional EXL3 plugin kernel exl3cuda.int8_kernels.draft_sample):
+    # temperature + softmax + argmax(probs / q) in one kernel; the exponential noise q still comes from torch's
+    # graph-safe exponential_(), so the distribution is upstream's exactly.
+    # Seeded requests are not special-cased: upstream's draft sampling below ignores generators too.
+    if (_EXL3_FAST_DRAFT_SAMPLE and sampling_metadata.all_random
+            and logits.is_cuda and logits.dim() == 2 and logits.stride(1) == 1 and not use_fp64_gumbel):
+        try:
+            from exl3cuda.int8_kernels import draft_sample as _ds
+        except Exception:  # noqa
+            _ds = None
+        if _ds is not None:
+            temp = sampling_metadata.temperature
+            temp = (temp if temp.dtype == torch.float32 else temp.float()).contiguous()
+            q = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)   # = empty_exponential_noise_like(probs)
+            q.exponential_()
+            return _ds(logits, temp, q)
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold
