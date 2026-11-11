@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -188,7 +189,14 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.speculative_config.use_eagle()
         )
         if use_eagle and not eagle_groups:
-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+            # MTP/EAGLE drafters have no Mamba layers, so Mamba groups are never
+            # draft groups. Flagging them made _lookup demand 2 consecutive Mamba state chunks,
+            # which align mode never stores (states only at prefill chunk ends): 0 hits ever.
+            eagle_groups = {
+                idx
+                for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+                if not isinstance(g.kv_cache_spec, MambaSpec)
+            }
 
         if eagle_groups:
             logger.info(
@@ -923,6 +931,22 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
+    _llmt_block_pool = None  # GPU block pool, set by the core scheduler (hybrid store filter)
+    _llmt_ssm_skipped = 0
+
+    def _llmt_ssm_ok(self, group_config, block_id: int) -> bool:
+        if group_config.sliding_window_size_in_chunks is None or self._llmt_block_pool is None:
+            return True
+        if os.environ.get("EXL3_HYBRID_STORE_FILTER", "1") == "0":
+            return True
+        if self._llmt_block_pool.blocks[block_id].block_hash is not None:
+            return True
+        self._llmt_ssm_skipped += 1
+        if self._llmt_ssm_skipped in (1, 10, 100) or self._llmt_ssm_skipped % 1000 == 0:
+            logger.info("Offloading: skipped %d uncached Mamba chunk store(s) so far",
+                        self._llmt_ssm_skipped)
+        return False
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -939,7 +963,10 @@ class OffloadingConnectorScheduler:
             req = req_status.req
 
             if req.is_finished():
-                num_tokens_after_batch = req.num_tokens
+                # A request finished mid-prefill (scheduler length cap, or an
+                # abort) has block ids only up to num_computed_tokens; storing past that
+                # trips the offload_keys/block_ids assert below.
+                num_tokens_after_batch = min(req.num_tokens, req.num_computed_tokens + 1)
             else:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
@@ -981,6 +1008,11 @@ class OffloadingConnectorScheduler:
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
+                        continue
+                    # In Mamba align mode only chunk-end blocks hold a
+                    # state; the others are allocated but never written. Store a Mamba chunk
+                    # only if the GPU prefix cache holds it as a state block.
+                    if not self._llmt_ssm_ok(group_config, block_id):
                         continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
@@ -1045,6 +1077,10 @@ class OffloadingConnectorScheduler:
                         continue
 
                     chunk_idx = start_chunk_idx + idx
+                    # Same filter as the key selection above.
+                    _last = block_ids[chunk_idx * blocks_per_chunk + blocks_per_chunk - 1]
+                    if _last == 0 or not self._llmt_ssm_ok(group_config, _last):
+                        continue
 
                     self._events_tracker.record_store(
                         req, group_config, chunk_idx, offload_key
