@@ -139,6 +139,64 @@ class _NanChecker:
             self.q.put(None)
 
 
+class _Pacer:
+    """Paced RAM-tier copies: queues a transfer's copies in sub-batches of <= handler._pace_bytes on the transfer's own
+    stream, waiting for each sub-batch to complete before queueing the next (see SingleDirectionOffloadingHandler
+    .__init__). Runs in its own thread; all CUDA calls are stream-ordered after the waits transfer_async already put on
+    the stream, so correctness is unchanged, only the copy engine's queue depth."""
+
+    def __init__(self, handler):
+        self.h = handler
+        self.q: _queue.Queue = _queue.Queue()
+        self.ev = None
+        self.n_jobs = self.n_sub = 0
+        self.th = _threading.Thread(target=self._run, name="kv-pace", daemon=True)
+        self.th.start()
+        logger.info("KV-PACE on: tier copies queued in sub-batches of %.0f MB, each waited before the next (%s)",
+                    handler._pace_bytes / 2**20, "GPU->CPU" if handler.gpu_to_cpu else "CPU->GPU")
+
+    def submit(self, job_id, stream, fn, src, dst, sizes, order_any, end_event):
+        self.q.put((job_id, stream, fn, src, dst, sizes, order_any, end_event))
+
+    def shutdown(self):
+        self.q.put(None)
+        self.th.join(timeout=30)
+
+    def _run(self):
+        if self.ev is None:
+            self.ev = torch.Event()
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            job_id, stream, fn, src, dst, sizes, order_any, end_event = item
+            try:
+                sz = sizes.numpy()
+                n = len(sz)
+                a = 0
+                with current_platform.stream(stream):
+                    while a < n:
+                        b, acc = a, 0
+                        while b < n and (b == a or acc + int(sz[b]) <= self.h._pace_bytes):
+                            acc += int(sz[b]); b += 1
+                        fn(src[a:b], dst[a:b], sizes[a:b], is_src_access_order_any=order_any)
+                        self.ev.record(stream)
+                        self.ev.synchronize()            # one sub-batch in the copy engine's queue at a time
+                        self.n_sub += 1
+                        a = b
+                    end_event.record(stream)
+                self.n_jobs += 1
+            except Exception as e:  # never leave a job unrecorded: record the end so the engine does not hang
+                logger.error("KV-PACE: job %d failed (%r); the transfer is reported finished", job_id, e)
+                try:
+                    with current_platform.stream(stream):
+                        end_event.record(stream)
+                except Exception:
+                    pass
+            finally:
+                self.h._pending_submit.discard(job_id)
+
+
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
@@ -345,6 +403,15 @@ class SingleDirectionOffloadingHandler:
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._nanchk = _NanChecker() if gpu_to_cpu else None
         self._nc_ops: dict[int, list] = {}
+        # Paced RAM-tier copies: EXL3_KV_COPY_PACE_MB=N
+        # submits a transfer's copies in sub-batches of <= N MB from a helper thread that waits for each sub-batch to
+        # finish before queueing the next, so the copy engine's queue never holds more than one sub-batch of tier
+        # traffic ahead of the decode steps' own small copies (a 58.8 MB block takes 34 ms on the 5090's Gen2 x4 link; the
+        # whole batch of a hit, several hundred MB, queued at once stalled decode steps by ~16 ms on average at 8 agents).
+        # 0 = off (upstream: one cuMemcpyBatchAsync per transfer).
+        self._pace_bytes = int(float(_os.environ.get("EXL3_KV_COPY_PACE_MB", "0") or 0) * 2**20)
+        self._pending_submit: set[int] = set()        # jobs whose copies the pacer has not fully queued yet
+        self._pacer = _Pacer(self) if self._pace_bytes > 0 else None
 
     def transfer_async(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
@@ -499,16 +566,34 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        with current_platform.stream(stream):
-            start_event.record(stream)
-            if num_copy_ops > 0:
-                self._swap_blocks_batch(
-                    src,
-                    dst,
-                    sizes,
-                    is_src_access_order_any=is_src_access_order_any,
-                )
-            end_event.record(stream)
+        if self._pacer is not None and num_copy_ops > 0:
+            # the GDN-neutral rewrite (vllm_tier._NeutralCopy, wrapped around _swap_blocks_batch)
+            # must run here, inside its transfer_async window and on the whole op list; the pacer then calls the real
+            # swap on sub-slices from its thread. end_event is recorded by the pacer after the last sub-batch.
+            fn = self._swap_blocks_batch
+            nc = getattr(fn, "__self__", None)
+            if nc is not None and hasattr(nc, "rewrite") and hasattr(nc, "orig_swap"):
+                new = nc.rewrite(src.numpy(), dst.numpy(), sizes.numpy())
+                if new is not None:
+                    pin = src.is_pinned()
+                    src, dst, sizes = (torch.from_numpy(x).pin_memory() if pin else torch.from_numpy(x) for x in new)
+                    nc.inflight[job_id] = (src, dst, sizes)
+                fn = nc.orig_swap
+            with current_platform.stream(stream):
+                start_event.record(stream)
+            self._pending_submit.add(job_id)
+            self._pacer.submit(job_id, stream, fn, src, dst, sizes, is_src_access_order_any, end_event)
+        else:
+            with current_platform.stream(stream):
+                start_event.record(stream)
+                if num_copy_ops > 0:
+                    self._swap_blocks_batch(
+                        src,
+                        dst,
+                        sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
+                end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
         if self._nanchk is not None and self._nanchk.on:
@@ -531,7 +616,10 @@ class SingleDirectionOffloadingHandler:
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0].end_event.query():
+        # an event not yet recorded reports query() == True, so a job still being queued by the
+        # pacer must not count as finished
+        while (self._transfers and self._transfers[0].job_id not in self._pending_submit
+               and self._transfers[0].end_event.query()):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
@@ -569,6 +657,8 @@ class SingleDirectionOffloadingHandler:
 
     def wait(self, job_ids: set[int]):
         for job_id in job_ids:
+            while job_id in self._pending_submit:       # let the pacer queue the rest first
+                time.sleep(0.0005)
             event = self._transfer_events.get(job_id)
             if event is not None:
                 event.synchronize()
@@ -576,6 +666,8 @@ class SingleDirectionOffloadingHandler:
     def shutdown(self) -> None:
         if self._nanchk is not None:
             self._nanchk.shutdown()
+        if self._pacer is not None:
+            self._pacer.shutdown()
         while self._transfers:
             transfer = self._transfers.popleft()
             transfer.end_event.synchronize()
