@@ -2995,3 +2995,163 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+
+# STALL-GUARD: generic liveness guard. Three scheduler deadlocks were found in an offline scheduler simulator
+# (HOLDER-RELEASE / HOL-HOLDERS fix the known ones); this catches the unknown ones. When requests are
+# pending but no token has been scheduled for EXL3_STALL_GUARD_S (5 s; 60 s while a KV load is in flight), it
+# escalates one level per period:
+#   1  dump the block holders (log), promote finished loads, release blocks of every non-running holder
+#   2  release the tail hold's pinned blocks, preempt every running request but the oldest
+#   3  finish the oldest running request as length-capped (the client sees finish_reason "length")
+#   4+ log only (every 60 s)
+# Any scheduled token resets it. Counters: self.stall_guard. EXL3_STALL_GUARD=0: off.
+import collections as _sg_collections
+_SG_ON = os.environ.get("EXL3_STALL_GUARD", "1") == "1"
+_SG_S = float(os.environ.get("EXL3_STALL_GUARD_S", "5"))
+_SG_LOAD_S = float(os.environ.get("EXL3_STALL_GUARD_LOAD_S", "60"))
+
+
+def _sg_now():
+    if os.environ.get("EXL3_STALL_GUARD_CLOCK") == "sim":   # offline simulator: its clock is __main__.SIM_NOW
+        import sys as _sys
+        return _sys.modules["__main__"].SIM_NOW[0]
+    return time.monotonic()
+
+
+def _sg_held(self, r):
+    try:
+        return sum(
+            sum(1 for b in m.req_to_blocks.get(r.request_id, ()) if not b.is_null)
+            for m in self.kv_cache_manager.coordinator.single_type_managers
+        )
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def _sg_dump(self, level, waited):
+    pool = self.kv_cache_manager.block_pool
+    rows = []
+    for r in list(self.running) + list(self.waiting) + list(getattr(self, "skipped_waiting", ())):
+        try:
+            need = self._request_remaining_blocks(r)
+        except Exception:  # noqa: BLE001
+            need = -1
+        rows.append("%s:%s:tok=%d:comp=%d:held=%d:need=%d%s" % (
+            r.request_id[-10:], r.status.name, r.num_tokens, r.num_computed_tokens, _sg_held(self, r), need,
+            ":loaded" if r.request_id in self.finished_recving_kv_req_ids else ""))
+    th = getattr(self, "_llmt_th", None)
+    try:
+        resv = "%d blocks for [%s]" % (self._inflight_prefill_reserved_blocks(), " ".join(
+            "%s:%s" % (r.request_id[-10:], r.status.name) for r in self._inflight_prefills))
+    except Exception as e:  # noqa: BLE001
+        resv = repr(e)
+    logger.warning("STALL-GUARD level %d after %.1f s without a scheduled token: free blocks %d/%d, tail-hold "
+                   "entries %s, load reservation %s, requests [%s]", level, waited, pool.get_num_free_blocks(),
+                   pool.num_gpu_blocks, len(getattr(th, "entries", ()) or ()) if th is not None else "-", resv,
+                   " ".join(rows))
+
+
+def _sg_level1(self):
+    n = 0
+    for q in (self.waiting, getattr(self, "skipped_waiting", ())):
+        for r in list(q):
+            if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS and r.request_id in self.finished_recving_kv_req_ids:
+                try:
+                    self._try_promote_blocked_waiting_request(r)
+                    n += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("STALL-GUARD: promote %r", e)
+    freed = self._release_waiting_holders(None, force=True)
+    return "promoted %d, released holders %s" % (n, freed)
+
+
+def _sg_level2(self, now_ts):
+    th = getattr(self, "_llmt_th", None)
+    msg = []
+    if th is not None and getattr(th, "entries", None):
+        try:
+            th.release_all("stall_guard")
+            msg.append("tail hold released")
+        except Exception as e:  # noqa: BLE001
+            msg.append("tail hold %r" % e)
+    if len(self.running) > 1:
+        keep = min(self.running, key=lambda r: r.arrival_time)
+        victims = [r for r in self.running if r is not keep]
+        for r in victims:
+            self.running.remove(r)
+            self._preempt_request(r, now_ts)
+        msg.append("preempted %d" % len(victims))
+    return ", ".join(msg) or "nothing to do"
+
+
+def _sg_level3(self):
+    if not self.running:
+        # nothing running and still nothing scheduled after levels 1-2 (all holders released): the request the
+        # scheduler would admit next cannot be admitted even into an (almost) empty cache; cap it so the rest proceed
+        q = self._select_waiting_queue_for_scheduling()
+        if q is None:
+            return "nothing running, nothing waiting"
+        r = q.peek_request()
+        self.lencap_req_ids.add(r.request_id)
+        logger.warning("STALL-GUARD: %s (%d tokens) cannot be admitted with %d of %d blocks free: finishing it as "
+                       "length-capped", r.request_id[-10:], r.num_tokens,
+                       self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                       self.kv_cache_manager.block_pool.num_gpu_blocks)
+        return "capped head waiting " + r.request_id[-10:]
+    r = min(self.running, key=lambda r: r.arrival_time)
+    self._lencap(r, "stalled (stall guard)")
+    return "capped " + r.request_id[-10:]
+
+
+def _sg_check(self, out):
+    g = self.__dict__.setdefault("stall_guard", _sg_collections.Counter())
+    pending = len(self.running) + len(self.waiting) + len(getattr(self, "skipped_waiting", ()))
+    if out.total_num_scheduled_tokens > 0 or pending == 0:
+        if self.__dict__.get("_sg_level", 0) > 0:
+            logger.warning("STALL-GUARD: progress again after level %d", self._sg_level)
+            g["recovered_after_level_%d" % self._sg_level] += 1
+        self._sg_t0 = None
+        self._sg_level = 0
+        return
+    now = _sg_now()
+    if self.__dict__.get("_sg_t0") is None:
+        self._sg_t0, self._sg_level, self._sg_last = now, 0, now
+        return
+    loading = any(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                  and r.request_id not in self.finished_recving_kv_req_ids
+                  for q in (self.waiting, getattr(self, "skipped_waiting", ())) for r in q)
+    period = _SG_LOAD_S if loading else _SG_S
+    waited = now - self._sg_t0
+    if waited < period * (self._sg_level + 1):
+        return
+    self._sg_level += 1
+    lvl = self._sg_level
+    if lvl >= 4 and now - self._sg_last < 60:
+        return
+    self._sg_last = now
+    _sg_dump(self, lvl, waited)
+    if lvl == 1:
+        act = _sg_level1(self)
+    elif lvl == 2:
+        act = _sg_level2(self, time.monotonic())
+    elif lvl == 3:
+        act = _sg_level3(self)
+    else:
+        act = "log only"
+    g["level_%d" % min(lvl, 4)] += 1
+    logger.warning("STALL-GUARD level %d: %s", lvl, act)
+
+
+if _SG_ON:
+    _sg_orig_schedule = Scheduler.schedule
+
+    def _sg_schedule(self, *a, **kw):
+        out = _sg_orig_schedule(self, *a, **kw)
+        try:
+            _sg_check(self, out)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("STALL-GUARD: check failed: %r", e)
+        return out
+    Scheduler.schedule = _sg_schedule
+    logger.info("STALL-GUARD: on (%.0f s, %.0f s while loading)", _SG_S, _SG_LOAD_S)
