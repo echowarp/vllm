@@ -71,6 +71,7 @@ logger = init_logger(__name__)
 # EXL3_HYBRID_CONN_LOOKUP=upstream restores upstream's per-group prefix lookup for hybrid (Mamba) models with a KV
 # connector; see schedule().
 _HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
+_ENC_CUT_USES = [0]   # ENC-CUT-GUARD uses (log throttle)
 _DSK_DECODE_COUNT = os.environ.get("EXL3_DYN_SD_DECODE_COUNT", "0") == "1"  # DSK (see dynamic SD in schedule())
 # MIXED-PROPOSE (see schedule()): draft depth PROPOSED for decode rows when the next step carries a prefill chunk: ""
 # off, "max", or a depth. Distinct from EXL3_SCHED_MIXED_K (caps the drafts SCHEDULED in such a step).
@@ -360,6 +361,13 @@ class Scheduler(SchedulerInterface):
             mm_budget.encoder_compute_budget if mm_budget else 0
         )
         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
+        # EXL3_ENCODER_CACHE_TOKENS=N: an encoder cache of its own size, independent of
+        # max_num_batched_tokens (vLLM sizes it = max_num_batched_tokens, so a multi-image prompt could
+        # hold the cache with its own earlier image; see ENC-CUT-GUARD in _mamba_block_aligned_split).
+        _ecs = int(os.environ.get("EXL3_ENCODER_CACHE_TOKENS", "0") or 0)
+        if mm_budget and _ecs > encoder_cache_size:
+            logger.info("Encoder cache %d -> %d tokens (EXL3_ENCODER_CACHE_TOKENS)", encoder_cache_size, _ecs)
+            encoder_cache_size = _ecs
         self.encoder_cache_manager = (
             EncoderDecoderCacheManager(cache_size=encoder_cache_size)
             if self.is_encoder_decoder
@@ -559,6 +567,18 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
+        # ENC-CUT-GUARD (livelock guard): the chunk ends at an encoder cut (the next image does not fit
+        # the encoder cache, which an earlier image of this same request still holds) and the block
+        # floor leaves nothing. Waiting cannot help (the request itself must advance past the earlier
+        # image to free it), so run the unaligned chunk: correct, only that position's state is not
+        # prefix-cacheable. EXL3_ENC_CUT_GUARD=0 disables.
+        if end <= start and num_new_tokens > 0 and getattr(request, "_llmt_enc_cut", False) \
+                and os.environ.get("EXL3_ENC_CUT_GUARD", "1") == "1":
+            _ENC_CUT_USES[0] += 1
+            if _ENC_CUT_USES[0] <= 5 or _ENC_CUT_USES[0] % 100 == 0:
+                logger.warning("ENC-CUT-GUARD: encoder-cut chunk kept unaligned (%d tokens; guard use %d)",
+                               num_new_tokens, _ENC_CUT_USES[0])
+            return num_new_tokens
         return max(end - start, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -1862,6 +1882,7 @@ class Scheduler(SchedulerInterface):
         Note that num_computed_tokens includes both locally cached
         blocks and externally cached blocks (via KVConnector).
         """
+        request._llmt_enc_cut = False
         if num_new_tokens == 0 or not request.has_encoder_inputs:
             return [], num_new_tokens, encoder_compute_budget, []
         encoder_inputs_to_schedule: list[int] = []
@@ -1950,6 +1971,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = start_pos - (
                         num_computed_tokens + shift_computed_tokens
                     )
+                    request._llmt_enc_cut = True     # ENC-CUT-GUARD: this chunk end is an encoder cut
                 else:
                     # Because of prefix caching, num_computed_tokens is greater
                     # than start_pos even though its encoder input is not
