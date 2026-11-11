@@ -5,6 +5,8 @@ from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import os
+
 import torch
 import torch.nn as nn
 
@@ -1847,6 +1849,9 @@ class SpecDecodeBaseProposer:
 # Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
 # FIXME(woosuk): The logic here is duplicated with the main sampling code.
 # We should refactor this to reuse the same sampling implementation.
+_EXL3_FAST_DRAFT_SAMPLE = os.environ.get("EXL3_FAST_DRAFT_SAMPLE", "1") == "1"
+
+
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1860,6 +1865,44 @@ def compute_probs_and_sample_next_token(
         return next_token_ids, probs
 
     assert sampling_metadata.temperature is not None
+    # Fused draft sampling (optional EXL3 plugin kernel exl3cuda.int8_kernels.draft_sample):
+    # temperature + softmax + argmax(probs / q) in one kernel; the exponential noise q still comes from torch's
+    # graph-safe exponential_(), so the distribution is upstream's exactly.
+    # Seeded requests are not special-cased: upstream's draft sampling below ignores generators too.
+    if (_EXL3_FAST_DRAFT_SAMPLE and sampling_metadata.all_random
+            and logits.is_cuda and logits.dim() == 2 and logits.stride(1) == 1 and not use_fp64_gumbel):
+        try:
+            from exl3cuda.int8_kernels import draft_sample as _ds
+        except Exception:  # noqa
+            _ds = None
+        if _ds is not None:
+            temp = sampling_metadata.temperature
+            temp = (temp if temp.dtype == torch.float32 else temp.float()).contiguous()
+            q = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)   # = empty_exponential_noise_like(probs)
+            q.exponential_()
+            return _ds(logits, temp, q)
+    # XPU: exl3xpu's fused draft sampler (softmax + exponential race in one pass over the row, 32 vs 232 us per
+    # row at vocab 248320). Same distribution; its RNG stream is a counter-based hash seeded from the torch XPU
+    # generator (advanced here, no device sync). Requests with their own generators keep the upstream path.
+    if (_EXL3_FAST_DRAFT_SAMPLE and sampling_metadata.all_random and not sampling_metadata.generators
+            and logits.is_xpu and logits.dim() == 2 and logits.stride(1) == 1 and not use_fp64_gumbel):
+        try:
+            op = torch.ops.exl3xpu_C.exl3_draft_sample
+        except (AttributeError, RuntimeError):
+            op = None
+        if op is not None:
+            x = logits if logits.dtype == torch.float32 else logits.float()
+            temp = sampling_metadata.temperature
+            temp = (temp if temp.dtype == torch.float32 else temp.float()).contiguous()
+            probs = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+            next_token_ids = torch.empty(x.shape[0], dtype=torch.int64, device=x.device)
+            gen = torch.xpu.default_generators[x.device.index]
+            state = gen.get_state()
+            seed, offset = (int(v) for v in state.view(torch.int64)[:2])
+            op(x, temp, probs, next_token_ids, seed, offset)
+            state.view(torch.int64)[1] = (offset + x.numel() + 3) // 4 * 4
+            gen.set_state(state)
+            return next_token_ids, probs
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold
