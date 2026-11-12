@@ -139,8 +139,22 @@ class _NanChecker:
             self.q.put(None)
 
 
+# KV-RING load staging: with decoders running, each ring sub-batch of a load waits ~20 ms for its copy (the copy queues
+# behind the decode steps' work), so a 1.8 GB prefix restore in 262 ring sub-batches took 5.5 s instead of 0.29 s.
+# EXL3_KV_RING_LOAD_MB=N: loads stage through an N MB pinned buffer (two halves) instead of the ring: N/2-sized
+# sub-batches, far fewer of them. Allocated on the first load, freed after EXL3_KV_RING_LOAD_IDLE_S (30) seconds
+# without one (nothing stays pinned while idle). 0 = loads use the ring.
+_LOAD_BYTES = int(float(_os.environ.get("EXL3_KV_RING_LOAD_MB", "0") or 0) * 2**20) // 4096 * 4096
+_LOAD_IDLE_S = float(_os.environ.get("EXL3_KV_RING_LOAD_IDLE_S", "30") or 30)
+
+
 class _Pacer:
-    """Paced RAM-tier copies: queues a transfer's copies in sub-batches of <= handler._pace_bytes on the transfer's own
+    """KV-RING: EXL3_KV_RING_MB=N gives the pacer a pinned staging ring of N MB (two halves). Loads: the CPU copies a
+    sub-batch's pages from the CPU tier into one half while the device DMAs the other half to the GPU; stores: the device
+    DMAs into one half while the CPU copies the previous half out to the CPU tier. The CPU tier's memory is then never
+    read or written by the device, so it needs no pinning or device mapping. 0 = off (direct copies).
+
+    Paced RAM-tier copies: queues a transfer's copies in sub-batches of <= handler._pace_bytes on the transfer's own
     stream, waiting for each sub-batch to complete before queueing the next (see SingleDirectionOffloadingHandler
     .__init__). Runs in its own thread; all CUDA calls are stream-ordered after the waits transfer_async already put on
     the stream, so correctness is unchanged, only the copy engine's queue depth."""
@@ -150,6 +164,15 @@ class _Pacer:
         self.q: _queue.Queue = _queue.Queue()
         self.ev = None
         self.n_jobs = self.n_sub = 0
+        self.ring_bytes = int(float(_os.environ.get("EXL3_KV_RING_MB", "0") or 0) * 2**20) // 4096 * 4096
+        self.ring = None
+        self.ring_stats = [0, 0.0, 0]   # bytes, seconds, jobs since the last log line
+        self.log_every = int(_os.environ.get("EXL3_KV_RING_LOG_EVERY", "20") or 20)
+        if self.ring_bytes > 0:
+            self.ring = torch.empty(self.ring_bytes, dtype=torch.int8, pin_memory=PIN_MEMORY)
+            self.ring_ev = [torch.Event(), torch.Event()]
+            logger.info("KV-RING on: %.0f MB staging ring (pinned %s) for %s copies", self.ring_bytes / 2**20,
+                        self.ring.is_pinned(), "GPU->CPU" if handler.gpu_to_cpu else "CPU->GPU")
         self.th = _threading.Thread(target=self._run, name="kv-pace", daemon=True)
         self.th.start()
         logger.info("KV-PACE on: tier copies queued in sub-batches of %.0f MB, each waited before the next (%s)",
@@ -166,10 +189,43 @@ class _Pacer:
         if self.ev is None:
             self.ev = torch.Event()
         while True:
-            item = self.q.get()
+            try:
+                item = self.q.get(timeout=5.0)
+            except _queue.Empty:
+                big = getattr(self, "big", None)
+                if big is not None and time.monotonic() - self.big_t > _LOAD_IDLE_S:
+                    self.big = None                      # idle: give the pinned load staging buffer back
+                    logger.info("KV-RING: load staging buffer (%.0f MB) freed after %.0f s idle", _LOAD_BYTES / 2**20,
+                                _LOAD_IDLE_S)
+                continue
             if item is None:
                 return
             job_id, stream, fn, src, dst, sizes, order_any, end_event = item
+            if self.ring is not None:
+                try:
+                    t0 = time.monotonic()
+                    nb = self._run_ring(stream, fn, src, dst, sizes, order_any)
+                    with current_platform.stream(stream):
+                        end_event.record(stream)
+                    self.n_jobs += 1
+                    st = self.ring_stats
+                    st[0] += nb; st[1] += time.monotonic() - t0; st[2] += 1
+                    if st[2] >= self.log_every:
+                        logger.info("KV-RING %s: %d jobs, %.2f GB in %.2f s (%.2f GB/s in copy time)",
+                                    "store" if self.h.gpu_to_cpu else "load", st[2], st[0] / 1e9, st[1],
+                                    st[0] / 1e9 / max(st[1], 1e-9))
+                        self.ring_stats = [0, 0.0, 0]
+                except Exception as e:
+                    logger.error("KV-RING: job %d failed (%r); the transfer is reported failed", job_id, e)
+                    self.h._failed.add(job_id)
+                    try:
+                        with current_platform.stream(stream):
+                            end_event.record(stream)
+                    except Exception:
+                        pass
+                finally:
+                    self.h._pending_submit.discard(job_id)
+                continue
             try:
                 sz = sizes.numpy()
                 n = len(sz)
@@ -195,6 +251,82 @@ class _Pacer:
                     pass
             finally:
                 self.h._pending_submit.discard(job_id)
+
+    def _run_ring(self, stream, fn, src, dst, sizes, order_any) -> int:
+        """One transfer through the staging ring. Returns the bytes moved. Sub-batches fill one ring half (<= ring/2
+        and <= the pace size); an op larger than a half is copied directly."""
+        sz = sizes.numpy().astype(np.int64)
+        S, D = src.numpy(), dst.numpy()
+        n = len(sz)
+        store = self.h.gpu_to_cpu
+        half = self.ring_bytes // 2
+        lim = min(half, self.h._pace_bytes) if self.h._pace_bytes > 0 else half
+        base = self.ring.data_ptr()
+        if _LOAD_BYTES > self.ring_bytes and not store:
+            # a load (a request waits for it): the on-demand load staging buffer, fewer and larger sub-batches
+            if getattr(self, "big", None) is None:
+                _t = time.perf_counter()
+                self.big = torch.empty(_LOAD_BYTES, dtype=torch.int8, pin_memory=PIN_MEMORY)
+                logger.info("KV-RING: load staging buffer %.0f MB allocated (pinned %s, %.0f ms)", _LOAD_BYTES / 2**20,
+                            self.big.is_pinned(), (time.perf_counter() - _t) * 1000)
+            self.big_t = time.monotonic()
+            base = self.big.data_ptr()
+            half = lim = _LOAD_BYTES // 2
+        batches, a = [], 0
+        while a < n:
+            b, acc = a, 0
+            while b < n and acc + int(sz[b]) <= lim:
+                acc += int(sz[b]); b += 1
+            if b == a:
+                batches.append((a, a + 1, True)); a += 1
+            else:
+                batches.append((a, b, False)); a = b
+        desc = [torch.empty(n, dtype=src.dtype, pin_memory=PIN_MEMORY) for _ in range(2)]
+        ev = self.ring_ev
+        used = [None, None]     # per half: (a, b) of the batch whose DMA uses it (stores: still to copy out)
+        memmove = _ct.memmove
+        with current_platform.stream(stream):
+            for k, (a, b, direct) in enumerate(batches):
+                h = k % 2
+                if used[h] is not None:
+                    ev[h].synchronize()
+                    if store:
+                        pa, pb = used[h]
+                        off = base + h * half
+                        for i in range(pa, pb):
+                            memmove(int(D[i]), off, int(sz[i])); off += int(sz[i])
+                    used[h] = None
+                if direct:
+                    fn(src[a:b], dst[a:b], sizes[a:b], is_src_access_order_any=order_any)
+                    ev[h].record(stream)
+                    ev[h].synchronize()
+                    continue
+                off = base + h * half
+                d = desc[h][: b - a]
+                dn = d.numpy()
+                if store:
+                    for i in range(a, b):
+                        dn[i - a] = off; off += int(sz[i])
+                    fn(src[a:b], d, sizes[a:b], is_src_access_order_any=order_any)
+                else:
+                    for i in range(a, b):
+                        memmove(off, int(S[i]), int(sz[i])); dn[i - a] = off; off += int(sz[i])
+                    fn(d, dst[a:b], sizes[a:b], is_src_access_order_any=order_any)
+                ev[h].record(stream)
+                used[h] = (a, b)
+                self.n_sub += 1
+            # drain: the other half first (it is older), then this one
+            last = (len(batches) - 1) % 2 if batches else 0
+            for h in (1 - last, last):
+                if used[h] is not None:
+                    ev[h].synchronize()
+                    if store:
+                        pa, pb = used[h]
+                        off = base + h * half
+                        for i in range(pa, pb):
+                            memmove(int(D[i]), off, int(sz[i])); off += int(sz[i])
+                    used[h] = None
+        return int(sz.sum())
 
 
 def _select_swap_blocks_fn(
@@ -411,6 +543,7 @@ class SingleDirectionOffloadingHandler:
         # 0 = off (upstream: one cuMemcpyBatchAsync per transfer).
         self._pace_bytes = int(float(_os.environ.get("EXL3_KV_COPY_PACE_MB", "0") or 0) * 2**20)
         self._pending_submit: set[int] = set()        # jobs whose copies the pacer has not fully queued yet
+        self._failed: set[int] = set()                # KV-RING: jobs whose host copies failed (reported success=False)
         self._pacer = _Pacer(self) if self._pace_bytes > 0 else None
 
     def transfer_async(
@@ -626,10 +759,11 @@ class SingleDirectionOffloadingHandler:
             )  # elapsed_time is in milliseconds
             result = TransferResult(
                 job_id=transfer.job_id,
-                success=True,
+                success=transfer.job_id not in self._failed,
                 transfer_size=transfer.num_bytes,
                 transfer_time=transfer_time,
             )
+            self._failed.discard(transfer.job_id)
 
             ranges = self._nc_ops.pop(transfer.job_id, None)
             if ranges is not None:
