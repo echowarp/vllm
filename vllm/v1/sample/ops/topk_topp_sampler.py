@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -342,10 +344,35 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     return probs.div(q).argmax(dim=-1).view(-1)
 
 
+# XPU: exl3xpu's fused top-k/top-p mask (one work-group per row: candidates in an adaptive window below the row max,
+# bitonic sort, top-k, then top-p over the kept set, in-place -inf mask) replaces the full-vocab sort when a top-k is
+# given. Used only when the exl3xpu plugin's op is registered. EXL3_FAST_TOPKP=0 disables.
+_EXL3_FAST_TOPKP = os.environ.get("EXL3_FAST_TOPKP", "1") == "1"
+_EXL3_NOFLAGS: dict = {}
+
+
+def _exl3_topkp(logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor | None) -> bool:
+    if not (_EXL3_FAST_TOPKP and logits.is_xpu and logits.dtype == torch.float32 and logits.dim() == 2
+            and logits.stride(1) == 1 and k.dtype in (torch.int32, torch.int64)):
+        return False
+    try:
+        op = torch.ops.exl3xpu_C.exl3_topk_topp_mask
+    except (AttributeError, RuntimeError):
+        return False
+    dev = logits.device
+    if dev not in _EXL3_NOFLAGS:
+        _EXL3_NOFLAGS[dev] = torch.empty(0, dtype=torch.int32, device=dev)
+    op(logits, k.contiguous(), p, _EXL3_NOFLAGS[dev])
+    return True
+
+
 def apply_top_k_top_p(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
     if p is None and k is None:
+        return logits
+
+    if k is not None and _exl3_topkp(logits, k, p):
         return logits
 
     if current_platform.is_cpu():
