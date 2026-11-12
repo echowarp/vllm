@@ -49,6 +49,9 @@ class GDNAttentionMetadata:
     num_actual_tokens: int
 
     has_initial_state: torch.Tensor | None = None
+    # num_computed_tokens per non-spec request (absolute position of its first new row); read by an out-of-tree
+    # GDN prefill kernel that needs each sequence's start position
+    pos0: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
     non_spec_query_start_loc: torch.Tensor | None = (
@@ -439,10 +442,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=gpu_device,
                 )
 
+        pos0 = None
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
+            pos0 = context_lens_tensor
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
+                pos0 = pos0[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
@@ -544,6 +550,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
             has_initial_state=has_initial_state,
+            pos0=pos0,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             prefill_query_start_loc=prefill_query_start_loc,
