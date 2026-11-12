@@ -263,6 +263,13 @@ _TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llm
 # the corrections are applied after the launch, as in non-align async mode. Other steps keep the synchronous path.
 # EXL3_ALIGN_NOSYNC=1 enables it.
 _ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
+# ALIGN-NOSYNC2: also skip the accepted-count wait when requests were added / finished / reordered, as long as every
+# CONTINUING speculative request stays inside its mamba block (same margin as ALIGN-NOSYNC). preprocess_mamba reads a
+# CPU count only for a request whose state block changes; continuing ones can't (margin) and new / non-speculative
+# ones copy with count 1 (MAMBA-ACC guarantees 1 on the CPU). The GPU counts are the previous step's GPU output
+# gathered through prev_positions (1 for new / non-spec rows). Resumed requests keep the sync path.
+# EXL3_ALIGN_NOSYNC2=0 = ALIGN-NOSYNC only (needs EXL3_ALIGN_NOSYNC=1).
+_ALIGN_NOSYNC2 = os.environ.get("EXL3_ALIGN_NOSYNC2", "1") == "1"
 _RC_PINNED = os.environ.get("EXL3_RC_PINNED", "0") == "1"  # RC-PINNED (see _llmt_gdn_rc)
 # SPEC-STOP: drop speculative tokens sampled AFTER a stop token on the GPU (see _llmt_stop_truncate)
 _SPEC_STOP = os.environ.get("EXL3_SPEC_STOP_TRUNC", "0") == "1"
@@ -2148,7 +2155,20 @@ class GPUModelRunner(
         if needs_cpu_accepted_counts and getattr(self, "_llmt_ns_quiet", False):
             # ALIGN-NOSYNC: same rows as last step -> the CPU copy would equal the postprocess output
             pp = self._get_mamba_bufs().postprocess_align
-            self.num_accepted_tokens.gpu[:num_reqs].copy_(pp.num_accepted_tokens_out[:num_reqs])
+            keep = getattr(self, "_llmt_ns_remap", None)
+            if keep is None:
+                self.num_accepted_tokens.gpu[:num_reqs].copy_(pp.num_accepted_tokens_out[:num_reqs])
+            else:                              # ALIGN-NOSYNC2: rows moved; gather by prev_positions, 1 for new rows
+                rb = self.__dict__.get("_llmt_ns2_idx")
+                if rb is None:
+                    rb = self._llmt_ns2_idx = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+                pv = self.prev_positions.np[:num_reqs]
+                rb.np[:num_reqs] = np.where(np.asarray(keep[:num_reqs], dtype=bool) & (pv >= 0), pv, -1)
+                rb.copy_to_gpu(num_reqs)
+                ix = rb.gpu[:num_reqs]
+                src = pp.num_accepted_tokens_out
+                self.num_accepted_tokens.gpu[:num_reqs].copy_(
+                    torch.where(ix >= 0, src.index_select(0, ix.clamp(min=0)), torch.ones_like(ix).to(src.dtype)))
             self.num_accepted_tokens.gpu[num_reqs:].fill_(1)
             needs_cpu_accepted_counts = False
         if needs_cpu_accepted_counts:
@@ -7970,6 +7990,34 @@ class GPUModelRunner(
         if (st["flushed"] + st["failed"]) % 500 < len(holds):
             logger.info("TAIL-HOLD: runner flushed %d, failed %d", st["flushed"], st["failed"])
 
+    def _llmt_align_quiet2(self, scheduler_output, req_ids, spec, prev_order, prev_spec, st) -> bool:
+        """ALIGN-NOSYNC2: rows changed; quiet if every continuing speculative request stays inside its block."""
+        bufs = self._get_mamba_bufs()
+        if bufs.postprocess_align is None:
+            return False
+        bs = bufs.preprocess.mamba_spec.block_size
+        margin = 3 * (self.num_spec_tokens + 1)
+        prev_set = set(prev_order)
+        keep = []
+        for rid in req_ids:
+            cont = rid in prev_set and rid in prev_spec
+            keep.append(cont)
+            if not cont:
+                continue                       # new / was not speculative last step: count 1, CPU values exact
+            if rid not in spec:
+                return False
+            c = self.requests[rid].num_computed_tokens
+            lo, hi = c - margin, c + scheduler_output.num_scheduled_tokens.get(rid, 0) + margin
+            if lo < 0 or lo // bs != hi // bs:
+                return False
+        self._llmt_ns_remap = keep
+        st2 = self.__dict__.setdefault("_llmt_ns2_stats", [0])
+        st2[0] += 1
+        if st2[0] in (1, 10, 100) or st2[0] % 2000 == 0:
+            logger.info("ALIGN-NOSYNC2: %d changed-row steps skipped the accepted-count wait", st2[0])
+        st[1] += 1
+        return True
+
     def _llmt_align_quiet(self, scheduler_output) -> bool:
         """ALIGN-NOSYNC: True if this step can skip the accepted-count wait (see _ALIGN_NOSYNC)."""
         req_ids = list(self.input_batch.req_ids)
@@ -7982,10 +8030,15 @@ class GPUModelRunner(
         if st[0] % 2000 == 0:
             logger.info("ALIGN-NOSYNC: %d of the last 2000 steps skipped the accepted-count wait", st[1])
             st[1] = 0
+        self._llmt_ns_remap = None
         if (not req_ids or req_ids != prev_order or self.cache_config.mamba_cache_mode != "align"
                 or not self.use_async_scheduling or self.num_accepted_tokens_event is None
                 or scheduler_output.scheduled_new_reqs or scheduler_output.finished_req_ids
                 or scheduler_output.scheduled_cached_reqs.resumed_req_ids):
+            if (_ALIGN_NOSYNC2 and req_ids and prev_order is not None and self.cache_config.mamba_cache_mode == "align"
+                    and self.use_async_scheduling and self.num_accepted_tokens_event is not None
+                    and not scheduler_output.scheduled_cached_reqs.resumed_req_ids):
+                return self._llmt_align_quiet2(scheduler_output, req_ids, spec, prev_order, prev_spec, st)
             return False
         bufs = self._get_mamba_bufs()
         if bufs.postprocess_align is None:
