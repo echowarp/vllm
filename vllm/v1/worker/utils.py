@@ -48,6 +48,7 @@ def _zero_kv_blocks_kernel(
     N_SEGS: tl.constexpr,
     PAGE_SIZE_EL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_STRIDE_EL: tl.constexpr = 0,
 ):
     """Zero KV cache blocks across all segments in a single launch.
 
@@ -73,8 +74,15 @@ def _zero_kv_blocks_kernel(
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+    # A block id steps BLOCK_STRIDE_EL elements (cross-layer layout: all layers' pages
+    # of a block are one row), but only PAGE_SIZE_EL elements (this segment's page)
+    # are zeroed. 0 = unpacked (stride == page).
+    if BLOCK_STRIDE_EL > 0:
+        blk_stride = BLOCK_STRIDE_EL
+    else:
+        blk_stride = PAGE_SIZE_EL
     offset = (
-        block_id.to(tl.int64) * PAGE_SIZE_EL + chunk_index.to(tl.int64) * BLOCK_SIZE
+        block_id.to(tl.int64) * blk_stride + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
@@ -117,6 +125,7 @@ class KVBlockZeroer:
             raise ValueError("max_concurrency must be at least 1")
         self.max_concurrency = max_concurrency
         self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        self._block_stride_el = 0
         self._id_cap: int = 0
         self._ids_pinned: list[torch.Tensor] = []
         self._ids_gpu: list[torch.Tensor] = []
@@ -127,6 +136,7 @@ class KVBlockZeroer:
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
         page_size_el: int | None = None
+        block_stride_el: int | None = None  # cross-layer layout: block stride != page
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -159,11 +169,23 @@ class KVBlockZeroer:
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
                 cur_page_el = kernel_block_el * ratio
+                # Cross-layer (packed) layout: stride(0) is the whole block (all
+                # layers' pages + state); zero only this layer's page, step by the
+                # block stride. Detected by a block stride larger than the layer
+                # page (unpacked: stride(block_dim) x ratio == page).
+                cur_stride_el = cur_page_el
+                if block_dim == 0 and ratio == 1 and cur_bytes > spec.page_size_bytes:
+                    assert spec.page_size_bytes % 4 == 0
+                    cur_page_el = spec.page_size_bytes // 4
                 if page_size_el is None:
                     page_size_el = cur_page_el
+                    block_stride_el = cur_stride_el
                 else:
                     assert page_size_el == cur_page_el, (
                         f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                    )
+                    assert block_stride_el == cur_stride_el, (
+                        f"Non-uniform block strides: {block_stride_el} vs {cur_stride_el}"
                     )
 
                 block_stride_bytes = cur_bytes
@@ -190,6 +212,17 @@ class KVBlockZeroer:
             blk_size,
             len(seg_addrs),
         )
+        # 0 = unpacked (block stride == page); kept out of _meta so its shape is unchanged
+        self._block_stride_el = (
+            0 if block_stride_el in (None, page_size_el) else block_stride_el
+        )
+        if self._block_stride_el:
+            logger.info(
+                "KVBlockZeroer: packed KV layout: %d segments of %d B, block stride %d B",
+                len(seg_addrs),
+                page_size_el * 4,
+                self._block_stride_el * 4,
+            )
 
     def _allocate_id_buffers(self) -> None:
         self._ids_pinned = [
@@ -236,6 +269,7 @@ class KVBlockZeroer:
             N_SEGS=n_segs,
             PAGE_SIZE_EL=page_size_el,
             BLOCK_SIZE=blk_size,
+            BLOCK_STRIDE_EL=self._block_stride_el,
         )
 
 
