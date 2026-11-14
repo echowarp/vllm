@@ -9,6 +9,7 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1 import extension_hooks
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
@@ -280,6 +281,10 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
+    @extension_hooks.around(
+        "kv_cache_manager.allocate_slots",
+        lambda self, a, k: (self, a[0] if a else k["request"]),
+    )
     def allocate_slots(
         self,
         request: Request,

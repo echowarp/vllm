@@ -55,6 +55,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1 import extension_hooks
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -499,6 +500,9 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        if extension_hooks.active("scheduler.init"):
+            extension_hooks.notify("scheduler.init", self)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -583,6 +587,8 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if extension_hooks.active("scheduler.before_schedule"):
+            extension_hooks.notify("scheduler.before_schedule", self)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -909,6 +915,16 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 if _holders_only and not self._waiting_holds_blocks(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # A plugin may hold a waiting request back for this step
+                # (admission control); it stays waiting like a skipped one.
+                if (
+                    extension_hooks.active("scheduler.admit")
+                    and extension_hooks.first("scheduler.admit", self, request) is False
+                ):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -1465,6 +1481,8 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if extension_hooks.active("scheduler.after_schedule"):
+            extension_hooks.notify("scheduler.after_schedule", self, scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1547,7 +1565,14 @@ class Scheduler(SchedulerInterface):
             )
         except Exception:
             return False
-        others = (pool.num_gpu_blocks - 1) - pool.get_num_free_blocks() - held
+        # blocks lent out of the pool (BlockPool.num_lent_blocks) are not held by
+        # other requests: waiting for them cannot help
+        others = (
+            (pool.num_gpu_blocks - 1)
+            - pool.get_num_free_blocks()
+            - held
+            - getattr(pool, "num_lent_blocks", 0)
+        )
         if others <= 0:
             self._lencap_wait_since.pop(request.request_id, None)
             return False
@@ -3421,7 +3446,11 @@ class _TailHold:
 
     def _below_watermark(self, extra: int = 0) -> bool:
         free = self.pool.get_num_free_blocks()
-        return free - extra - self._reserve() < self.free_frac * self.pool.num_gpu_blocks
+        # lent blocks are outside the KV pool while lent: the watermark is a share of
+        # what is left
+        return free - extra - self._reserve() < self.free_frac * (
+            self.pool.num_gpu_blocks - getattr(self.pool, "num_lent_blocks", 0)
+        )
 
     def _preempted_waiting(self) -> bool:
         try:
