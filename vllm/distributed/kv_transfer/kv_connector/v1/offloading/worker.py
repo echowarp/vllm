@@ -77,6 +77,17 @@ class OffloadingConnectorWorker:
             for kv_tensor in kv_cache_config.kv_cache_tensors
             for ln in kv_tensor.shared_by
         }
+        # A hybrid (attention + Mamba/GDN) model in the cross-layer (packed) layout
+        # registers one (num_blocks, page) view per slot, strided by the packed
+        # block: the same tensors, page sizes, refs and op sizes as the unpacked
+        # layout, so offloaded bytes and transfer plans do not change. The
+        # one-ref-per-group packed path stays for all-UniformType configs.
+        upstream_packed = all(
+            isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+            for g in kv_cache_config.kv_cache_groups
+        )
+        # layer_name -> byte offset of its slot inside the packed block (0 unpacked)
+        slot_offset_bytes: dict[str, int] = {}
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -133,16 +144,35 @@ class OffloadingConnectorWorker:
                     # from the first state tensor
                     assert len(state_tensors) > 0
                     first_state_tensor = state_tensors[0]
-                    assert first_state_tensor.storage_offset() == 0
-                    tensor = (
-                        torch.tensor(
-                            [],
+                    if layer_is_packed[layer_name]:
+                        # the page of this slot, strided by the packed block (the first
+                        # state tensor starts the page: states are laid out from offset 0)
+                        elem_size = first_state_tensor.element_size()
+                        byte_offset = first_state_tensor.storage_offset() * elem_size
+                        block_stride_bytes = first_state_tensor.stride(0) * elem_size
+                        raw = torch.empty(
+                            0,
                             dtype=torch.int8,
                             device=first_state_tensor.device,
+                        ).set_(first_state_tensor.untyped_storage())
+                        tensor = torch.as_strided(
+                            raw,
+                            (num_blocks, layer_kv_cache_spec.page_size_bytes),
+                            (block_stride_bytes, 1),
+                            byte_offset,
                         )
-                        .set_(first_state_tensor.untyped_storage())
-                        .view((num_blocks, layer_kv_cache_spec.page_size_bytes))
-                    )
+                        slot_offset_bytes[layer_name] = byte_offset
+                    else:
+                        assert first_state_tensor.storage_offset() == 0
+                        tensor = (
+                            torch.tensor(
+                                [],
+                                dtype=torch.int8,
+                                device=first_state_tensor.device,
+                            )
+                            .set_(first_state_tensor.untyped_storage())
+                            .view((num_blocks, layer_kv_cache_spec.page_size_bytes))
+                        )
                     tensors_per_block[layer_name] = (tensor,)
 
                     page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
@@ -161,7 +191,7 @@ class OffloadingConnectorWorker:
             ),
             None,
         )
-        if packed_kv_cache_tensor is not None:
+        if packed_kv_cache_tensor is not None and upstream_packed:
             (tensor,) = tensors_per_block[packed_kv_cache_tensor.shared_by[0]]
             block_stride = tensor.stride(0)
             packed_tensor = tensor.as_strided(
@@ -256,7 +286,8 @@ class OffloadingConnectorWorker:
                         elif isinstance(lspec, MambaSpec):
                             segs = []
                             for si, st in enumerate(kv_caches[layer_name]):
-                                off = st.storage_offset() * st.element_size()
+                                # offsets within the page (the packed slot offset subtracted)
+                                off = st.storage_offset() * st.element_size() - slot_offset_bytes.get(layer_name, 0)
                                 n = st[0].numel() * st.element_size()
                                 # conv state [blocks, conv rows, dim]: only the first EXL3_KV_NANCHECK_CONV_ROWS rows (the
                                 # kernel-1 = 3 history rows) are state; the extra rows are the per-draft spec window, which
@@ -282,6 +313,13 @@ class OffloadingConnectorWorker:
         except Exception as e:
             logger.warning("KV-NANCHECK: no page layout (%r); stores are not scanned", e)
 
+        if packed_kv_cache_tensor is not None and not upstream_packed:
+            logger.info(
+                "Cross-layer KV offload: %d per-slot views (num_blocks %d, block stride %d B), same refs as unpacked",
+                len(block_tensors),
+                num_blocks,
+                block_tensors[0].tensor.stride(0) if block_tensors else 0,
+            )
         self._init_worker(canonical_kv_caches)
 
     def register_cross_layers_kv_cache(
