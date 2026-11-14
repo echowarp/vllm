@@ -11,6 +11,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1 import extension_hooks
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -195,6 +196,11 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Blocks a plugin has taken out of the pool for another use (for
+        # example lent to activations or adapters). They are not KV while lent,
+        # so get_usage() leaves them out of the total.
+        self.num_lent_blocks = 0
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -209,6 +215,8 @@ class BlockPool:
         Returns:
             The cached blocks if exists, or None.
         """
+        if extension_hooks.active("block_pool.get_cached_block"):
+            extension_hooks.notify("block_pool.get_cached_block", self, block_hash)
         cached_blocks = []
         for group_id in kv_cache_group_ids:
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -339,6 +347,14 @@ class BlockPool:
                     kv_cache_group_id=kv_cache_group_id,
                     extra_keys_list=extra_keys_list,
                 )
+            )
+        if extension_hooks.active("block_pool.cache_full_blocks"):
+            extension_hooks.notify(
+                "block_pool.cache_full_blocks",
+                self,
+                request,
+                num_cached_blocks,
+                num_full_blocks,
             )
 
     def _build_block_stored_event(
@@ -658,6 +674,14 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        if extension_hooks.active("block_pool.get_new_blocks"):
+            placed = extension_hooks.first(
+                "block_pool.get_new_blocks", self, num_blocks
+            )
+            if placed is not None:
+                assert len(placed) == num_blocks
+                return placed
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
@@ -707,6 +731,8 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        if extension_hooks.active("block_pool.touch"):
+            extension_hooks.notify("block_pool.touch", self, blocks)
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
@@ -811,6 +837,10 @@ class BlockPool:
 
         # Subtract 1 to account for null block.
         total_gpu_blocks = self.num_gpu_blocks - 1
+        if self.num_lent_blocks:
+            total_gpu_blocks = max(1, total_gpu_blocks - self.num_lent_blocks)
+            usage = 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+            return max(0.0, min(1.0, usage))
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

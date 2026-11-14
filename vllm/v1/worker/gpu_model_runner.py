@@ -132,6 +132,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1 import extension_hooks
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -3984,6 +3985,9 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    @extension_hooks.around(
+        "model_runner.model_forward", lambda self, a, k: (self, a, k)
+    )
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4271,6 +4275,7 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
+    @extension_hooks.around("model_runner.execute_model")
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -5174,6 +5179,7 @@ class GPUModelRunner(
             return None
         return torch.cat(draft_probs_rows, dim=0).contiguous()
 
+    @extension_hooks.around("model_runner.propose_draft")
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7764,6 +7770,10 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        if extension_hooks.active("model_runner.kv_caches_initialized"):
+            extension_hooks.notify(
+                "model_runner.kv_caches_initialized", self, kv_caches, kv_cache_config
+            )
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

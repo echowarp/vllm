@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.v1 import extension_hooks
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.device_allocator import get_mem_allocator_instance
@@ -445,6 +446,7 @@ class Worker(WorkerBase):
         self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
+    @extension_hooks.after("worker.available_kv_memory")
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -743,6 +745,7 @@ class Worker(WorkerBase):
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
+    @extension_hooks.after("worker.warmed_up")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 

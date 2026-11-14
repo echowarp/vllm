@@ -30,6 +30,7 @@ Example::
 from __future__ import annotations
 
 import contextlib
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -187,3 +188,52 @@ def context(name: str, *args: Any) -> contextlib.AbstractContextManager:
             if cm is not None:
                 stack.enter_context(cm)
         return stack.pop_all()
+
+
+def around(
+    name: str,
+    hook_args: Callable[[Any, tuple, dict], tuple] | None = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Method decorator for a ``context`` hook: runs the method inside
+    :func:`context` (``name``). ``hook_args(self, args, kwargs)`` gives the
+    hook arguments (default ``(self,)``). With nothing registered the wrapper
+    calls the method directly."""
+    _check(name)
+
+    def deco(method: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            if name not in _registry:
+                return method(self, *args, **kwargs)
+            hargs = hook_args(self, args, kwargs) if hook_args else (self,)
+            with context(name, *hargs):
+                return method(self, *args, **kwargs)
+
+        return wrapper
+
+    return deco
+
+
+def after(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Method decorator for a ``notify`` or ``fold`` hook called with the
+    method's result: ``notify(name, self)`` after the call, or
+    ``result = fold(name, result, self)``. With nothing registered the wrapper
+    calls the method directly."""
+    _check(name)
+    kind = HOOKS[name][0]
+    assert kind in (NOTIFY, FOLD), name
+
+    def deco(method: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            result = method(self, *args, **kwargs)
+            if name not in _registry:
+                return result
+            if kind == FOLD:
+                return fold(name, result, self)
+            notify(name, self)
+            return result
+
+        return wrapper
+
+    return deco
