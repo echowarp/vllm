@@ -342,19 +342,28 @@ def _reshape_kv_cache(
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
                 state_tensors = []
+                # Cross-layer (packed) KV: block stride and slot offset from the
+                # packing (same fix as the V1 runner); unpacked: (0, page).
+                if packing is not None:
+                    pack_offset_bytes, block_stride_bytes = packing
+                else:
+                    pack_offset_bytes = 0
+                    block_stride_bytes = kv_cache_spec.page_size_bytes
                 storage_offset_bytes = 0
                 for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                     dtype_size = get_dtype_size(dtype)
-                    num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
+                    assert block_stride_bytes % dtype_size == 0
+                    num_element_per_block = block_stride_bytes // dtype_size
                     target_shape = (num_blocks, *shape)
-                    stride = torch.empty(target_shape).stride()
-                    target_stride = (num_element_per_page, *stride[1:])
-                    assert storage_offset_bytes % dtype_size == 0
+                    stride = torch.empty(target_shape, device="meta").stride()
+                    target_stride = (num_element_per_block, *stride[1:])
+                    assert (pack_offset_bytes + storage_offset_bytes) % dtype_size == 0
                     tensor = torch.as_strided(
                         kv_raw_tensor.view(dtype),
                         size=target_shape,
                         stride=target_stride,
-                        storage_offset=storage_offset_bytes // dtype_size,
+                        storage_offset=(pack_offset_bytes + storage_offset_bytes)
+                        // dtype_size,
                     )
                     state_tensors.append(tensor)
                     storage_offset_bytes += stride[0] * dtype_size
