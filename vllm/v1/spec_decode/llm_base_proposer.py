@@ -1069,8 +1069,11 @@ class SpecDecodeBaseProposer:
             self.backup_next_token_ids.np[i] = requests[
                 gpu_input_batch.req_ids[i]
             ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
+        # A fresh pinned copy per step: the persistent buffer's non-blocking H2D copy could run after the next step's
+        # CPU had rewritten ``.np`` (async scheduling with quiet steps; a re-laid-out batch then fed another row's -1
+        # placeholder to the drafter's embedding: device-side "index out of bounds").
+        _bk = torch.from_numpy(self.backup_next_token_ids.np.copy()).pin_memory()
+        backup_tokens_gpu = _bk.to(device=self.backup_next_token_ids.gpu.device, non_blocking=True)
 
         batch_size, num_tokens = sampled_token_ids.shape
         device = sampled_token_ids.device
