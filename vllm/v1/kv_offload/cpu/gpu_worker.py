@@ -86,7 +86,10 @@ class _NanChecker:
             t0 = time.monotonic()
             bad = None
             try:
-                bad = self._scan(result.job_id, ops)
+                # never read back a failed store: its pool pages may be unallocated (full or over-quota tmpfs), and a read fault
+                # there SIGBUSes the engine
+                if result.success:
+                    bad = self._scan(result.job_id, ops)
             except Exception as e:  # never fail the engine on a scanner bug
                 logger.warning("KV-NANCHECK: scan error on store job %d: %r", result.job_id, e)
             dt = time.monotonic() - t0
