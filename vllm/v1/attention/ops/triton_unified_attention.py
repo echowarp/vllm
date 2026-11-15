@@ -10,6 +10,7 @@
 from typing import Any
 
 import os
+from vllm.v1 import llmt_defaults as _llmt
 
 import torch
 
@@ -959,11 +960,11 @@ def unified_attention(
     # (Qwen3.8: 24 query / 4 KV heads) BLOCK_M 16 holds 16 // 6 = 2 query rows, so a 7-row verify step runs 4 q-blocks
     # per (sequence, KV head) and each re-reads the whole KV: measured ~4-6x over the bandwidth floor. EXL3_ATTN_VERIFY_BM
     # = 64 -> 10 rows per block: one q-block per sequence, KV read once. 0 = upstream.
-    _vbm = int(os.environ.get("EXL3_ATTN_VERIFY_BM", "0"))
+    _vbm = int(_llmt.env("EXL3_ATTN_VERIFY_BM", "32", "0"))
     if _vbm and 1 < max_seqlen_q <= int(os.environ.get("EXL3_ATTN_3D_MAXQ", "8")) and not tuned_large_head:
         BLOCK_M = _vbm
         BLOCK_Q = BLOCK_M // num_queries_per_kv
-        launch_num_warps = int(os.environ.get("EXL3_ATTN_VERIFY_WARPS", "8"))
+        launch_num_warps = int(_llmt.env("EXL3_ATTN_VERIFY_WARPS", "2", "8"))
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1087,7 +1088,7 @@ def unified_attention(
     # by the per-launch NUM_SEGMENTS_PER_SEQ, so a launch may use fewer. Few sequences need many segments to fill the
     # 170 SMs (1 seq x 20k ctx: 32 seg 117 us, 64 seg 77 us); many sequences do better with fewer (8 x 9k: 32 seg 167 us,
     # 64 seg 183 us). EXL3_ATTN_SEGMENTS_MANY = segments when num_seqs > EXL3_ATTN_SEG_FEW_MAX (default 2); 0 = off.
-    _seg_many = int(os.environ.get("EXL3_ATTN_SEGMENTS_MANY", "0"))
+    _seg_many = int(_llmt.env("EXL3_ATTN_SEGMENTS_MANY", "32", "0"))
     if use_3d and _seg_many and num_seqs > int(os.environ.get("EXL3_ATTN_SEG_FEW_MAX", "2")):
         num_par_softmax_segments = min(num_par_softmax_segments, _seg_many)
     segm_output_ptr = softmax_segm_output if use_3d else None

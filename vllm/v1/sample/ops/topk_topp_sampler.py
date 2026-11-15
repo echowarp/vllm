@@ -3,6 +3,7 @@
 
 
 import os
+from vllm.v1 import llmt_defaults as _llmt
 
 import torch
 import torch.nn as nn
@@ -344,7 +345,7 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     return probs.div(q).argmax(dim=-1).view(-1)
 
 
-_EXL3_FI_SOFTMAX = os.environ.get("EXL3_FI_TOPKP", "0") == "1"
+_EXL3_FI_SOFTMAX = _llmt.flag(__name__, "_EXL3_FI_SOFTMAX", "EXL3_FI_TOPKP", "1", "0", lambda v: v == "1")
 
 
 def apply_top_k_top_p(

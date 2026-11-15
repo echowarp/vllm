@@ -61,12 +61,40 @@ dict lookup. The XPU model runner and worker inherit these methods, so the same 
 for another use sets it, and `get_usage()`, the scheduler's length-cap wait and the tail-hold watermark leave those
 blocks out.
 
+## EXL3_* switch defaults (`vllm/v1/llmt_defaults.py`)
+
+The branch's engine features are switched by `EXL3_*` variables. A variable that is set (also to an empty string)
+always wins. An unset one takes the reference build's value **only while the EXL3 plugin serves the model**: the
+model's quantization is `exl3` (a method that only exl3cuda registers) and the GPU is sm_120 (RTX 5090). Every other model, and
+this branch without the plugin, keeps upstream behaviour. `activate(vllm_config)` decides once per process (first
+thing in `Scheduler.__init__` and `GPUModelRunner.__init__`); module constants made with `flag()` are re-evaluated
+then, `env()` reads the decision on every call.
+
+| Variable | Upstream (inactive) | While the plugin serves an EXL3 model |
+|---|---|---|
+| `EXL3_ALIGN_NOSYNC` | 0 | 1 |
+| `EXL3_SPEC_STOP_TRUNC` | 0 | 1 |
+| `EXL3_TAIL_HOLD` | 0 | 1 (inert until the runner confirms GDN recompute) |
+| `EXL3_TAIL_HOLD_FREE` | 0.15 | 0.03 |
+| `EXL3_EAGLE_KEEP` | 0 | 2 (core and offloading-connector scheduler) |
+| `EXL3_SCHED_DECODE_STEPS` | 0 | 1 |
+| `EXL3_DYN_SD_DECODE_COUNT` | 0 | 1 |
+| `EXL3_ENCODER_CACHE_TOKENS` | 0 | 16384 |
+| `EXL3_GPU_EVICT_ORDER` | (vLLM order) | chain |
+| `EXL3_FI_TOPKP` | 0 | 1 (rejection sampler and top-k/top-p sampler) |
+| `EXL3_ATTN_SEGMENTS` | 32 | 64 |
+| `EXL3_ATTN_SEGMENTS_MANY` | 0 | 32 |
+| `EXL3_ATTN_VERIFY_BM` | 0 | 32 |
+| `EXL3_ATTN_VERIFY_WARPS` | 8 | 2 |
+| `EXL3_GDN_RECOMPUTE` | off | follows the plugin's `GDN_RC["on"]` (on by default for EXL3 models; the plugin clears it when its half cannot install). `EXL3_GDN_RECOMPUTE=1` forces it for any model |
+| `EXL3_RC_PINNED` | 1 | 1 (only used with GDN recompute) |
+
 ## Tests (CPU, no GPU needed)
 
 ```bash
 TRITON_INTERPRET=1 VLLM_KV_CACHE_LAYOUT=NHD pytest -q --noconftest \
     tests/v1/core/test_extension_hooks.py tests/v1/worker/test_packed_kv_hybrid.py \
-    tests/v1/worker/test_llmt_gdn_rc_switch.py
+    tests/v1/test_llmt_defaults.py
 ```
 
 `test_extension_hooks.py`: registry semantics, the decorators, block-pool placement override and lent-block usage,

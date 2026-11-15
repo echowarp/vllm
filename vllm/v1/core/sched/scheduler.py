@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.v1 import llmt_defaults as _llmt
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -73,7 +74,7 @@ logger = init_logger(__name__)
 # connector; see schedule().
 _HYBRID_CONN_UPSTREAM = os.environ.get("EXL3_HYBRID_CONN_LOOKUP", "") == "upstream"
 _ENC_CUT_USES = [0]   # ENC-CUT-GUARD uses (log throttle)
-_DSK_DECODE_COUNT = os.environ.get("EXL3_DYN_SD_DECODE_COUNT", "0") == "1"  # DSK (see dynamic SD in schedule())
+_DSK_DECODE_COUNT = _llmt.flag(__name__, "_DSK_DECODE_COUNT", "EXL3_DYN_SD_DECODE_COUNT", "1", "0", lambda v: v == "1")  # DSK (see dynamic SD in schedule())
 # MIXED-PROPOSE (see schedule()): draft depth PROPOSED for decode rows when the next step carries a prefill chunk: ""
 # off, "max", or a depth. Distinct from EXL3_SCHED_MIXED_K (caps the drafts SCHEDULED in such a step).
 _MIXED_PROPOSE = os.environ.get("EXL3_SCHED_MIXED_PROPOSE", "")
@@ -88,14 +89,18 @@ _MIXED_PROPOSE = os.environ.get("EXL3_SCHED_MIXED_PROPOSE", "")
 # EXL3_EAGLE_KEEP=2: always keep the full hit, no tracking. A missing drafter entry is then zeros (KV allocated with
 # torch.zeros, int8 scales filled with 1.0) or stale finite data from an earlier owner: at most one slightly wrong
 # position in the drafter's context; drafts only.
-_EAGLE_KEEP_MODE = os.environ.get("EXL3_EAGLE_KEEP", "0")
-_EAGLE_KEEP = _EAGLE_KEEP_MODE in ("1", "2")
+# Unset: 2 while the EXL3 plugin serves the model (vllm/v1/llmt_defaults.py), else 0. The wrapper below is always
+# installed and calls vLLM's lookup directly while _EAGLE_KEEP is off.
+_EAGLE_KEEP_MODE = _llmt.flag(__name__, "_EAGLE_KEEP_MODE", "EXL3_EAGLE_KEEP", "2", "0")
+_EAGLE_KEEP = _llmt.flag(__name__, "_EAGLE_KEEP", "EXL3_EAGLE_KEEP", "2", "0", lambda v: v in ("1", "2"))
 _EK_DONE: dict = {}          # draft-group physical block_id -> block_hash at completion
 _EK_STAT = {"hits": 0, "kept": 0, "fallback": 0, "saved_tokens": 0}
-if _EAGLE_KEEP:
+if True:   # EAGLE-KEEP wrapper (inert while _EAGLE_KEEP is off)
     _ek_orig_flch = HybridKVCacheCoordinator.find_longest_cache_hit
 
     def _ek_flch(self, block_hashes, max_cache_hit_length):
+        if not _EAGLE_KEEP:
+            return _ek_orig_flch(self, block_hashes, max_cache_hit_length)
         groups = self.attention_groups
         eg = [i for i, g in enumerate(groups) if g.use_eagle]
         if not eg:
@@ -182,6 +187,7 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
+        _llmt.activate(vllm_config)   # EXL3_* defaults (vllm/v1/llmt_defaults.py); before the connector is built
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
@@ -325,7 +331,7 @@ class Scheduler(SchedulerInterface):
         # EXL3_SCHED_DECODE_STEPS=N (default 0 = upstream): after a step that ran prefill work next to
         # running decodes, run N decode-only steps (reusing the DP defer_prefills path) so running
         # streams keep generating during a long prefill.
-        self.decode_interleave = int(os.environ.get("EXL3_SCHED_DECODE_STEPS", "0"))
+        self.decode_interleave = int(_llmt.env("EXL3_SCHED_DECODE_STEPS", "1", "0"))
         self._decode_only_left = 0
         # EXL3_SCHED_MIXED_CHUNK=N[,N2,...] (0 = off): while running requests are decoding, cap a prefill
         # chunk at N tokens (rounded up to a whole number of KV blocks: Mamba align mode ends chunks on
@@ -365,7 +371,7 @@ class Scheduler(SchedulerInterface):
         # EXL3_ENCODER_CACHE_TOKENS=N: an encoder cache of its own size, independent of
         # max_num_batched_tokens (vLLM sizes it = max_num_batched_tokens, so a multi-image prompt could
         # hold the cache with its own earlier image; see ENC-CUT-GUARD in _mamba_block_aligned_split).
-        _ecs = int(os.environ.get("EXL3_ENCODER_CACHE_TOKENS", "0") or 0)
+        _ecs = int(_llmt.env("EXL3_ENCODER_CACHE_TOKENS", "16384", "0") or 0)
         if mm_budget and _ecs > encoder_cache_size:
             logger.info("Encoder cache %d -> %d tokens (EXL3_ENCODER_CACHE_TOKENS)", encoder_cache_size, _ecs)
             encoder_cache_size = _ecs
@@ -431,7 +437,7 @@ class Scheduler(SchedulerInterface):
             _cs = getattr(self.connector, "connector_scheduler", None)
             if _cs is not None:
                 _cs._llmt_block_pool = self.kv_cache_manager.block_pool
-        if os.environ.get("EXL3_GPU_EVICT_ORDER", "") == "chain":
+        if _llmt.env("EXL3_GPU_EVICT_ORDER", "chain", "") == "chain":
             _install_chain_free_order(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -3370,7 +3376,7 @@ class Scheduler(SchedulerInterface):
 # hold while a preempted request waits. Inert unless EXL3_TAIL_HOLD=1 (and the runner in this process confirmed).
 # Requires the GDN recompute path in the model runner (EXL3_GDN_RECOMPUTE=1, EXL3 runtime plugin) and
 # mamba_cache_mode="align".
-_TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"
+_TAIL_HOLD = _llmt.flag(__name__, "_TAIL_HOLD", "EXL3_TAIL_HOLD", "1", "0", lambda v: v == "1")
 _TH_TOOL_IDS = {int(x) for x in os.environ.get("EXL3_TAIL_HOLD_TOOL_IDS", "").split(",") if x.strip()}
 _TH_LOG = os.environ.get("EXL3_TAIL_HOLD_LOG", "0") == "1"     # one line per hold / hit (tests)
 # shared with the model runner (same process): runner_ok, flushed {rid: bool}, zero_next [(group_id, block_id)]
@@ -3403,7 +3409,7 @@ class _TailHold:
         self.ttl = float(os.environ.get("EXL3_TAIL_HOLD_S", "60"))
         self.ttl_tool = float(os.environ.get("EXL3_TAIL_HOLD_TOOL_S", "300"))
         self.max = int(os.environ.get("EXL3_TAIL_HOLD_MAX", "16"))
-        self.free_frac = float(os.environ.get("EXL3_TAIL_HOLD_FREE", "0.15"))
+        self.free_frac = float(_llmt.env("EXL3_TAIL_HOLD_FREE", "0.03", "0.15"))
         self.cool = float(os.environ.get("EXL3_TAIL_HOLD_COOLDOWN_S", "30"))
         # Selective release: holds are ranked by expected reuse = (tool-call finish ? 2 : 1) * exp(-age / decay); memory pressure
         # releases the lowest-ranked holds one at a time instead of all of them (production replay: 27 of 92 holds were

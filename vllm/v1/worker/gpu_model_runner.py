@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+from vllm.v1 import llmt_defaults as _llmt
 
 _MAMBA_ACC_FIX = os.environ.get("EXL3_MAMBA_ACC_FIX", "1") == "1"  # MAMBA-ACC (see execute_model)
 
@@ -260,6 +261,8 @@ def _gdn_rc_on() -> bool:
     = EXL3_GDN_RECOMPUTE (unset: on with an sm_120 GPU), cleared by the plugin when its half cannot install. Without
     the plugin it is off. Both halves read one switch, so they cannot disagree. First called after plugin registration
     (KV-cache init), then cached."""
+    if os.environ.get("EXL3_GDN_RECOMPUTE") is None and not _llmt.active():
+        return False      # default: only while the EXL3 plugin serves the model (vllm/v1/llmt_defaults.py)
     try:
         from exl3cuda.vllm_plugin import GDN_RC
         return bool(GDN_RC.get("on"))
@@ -267,7 +270,7 @@ def _gdn_rc_on() -> bool:
         return False
 
 
-_TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llmt_tail_hold)
+_TAIL_HOLD = _llmt.flag(__name__, "_TAIL_HOLD", "EXL3_TAIL_HOLD", "1", "0", lambda v: v == "1")  # TAIL-HOLD (see _llmt_tail_hold)
 # ALIGN-NOSYNC: with mamba_cache_mode="align" + async scheduling + spec decode, vLLM waits every step for the previous
 # step's accepted-token counts on the CPU (num_accepted_tokens_event) and applies the deferred spec corrections
 # (another wait) before preprocess_mamba, so the CPU prepares step n+1 only after step n has finished and the GPU idles
@@ -276,8 +279,8 @@ _TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llm
 # speculative both steps, every request >= 3*(k+1) tokens away from a mamba block boundary) the counts are taken on
 # the GPU (copy of the postprocess output) instead, preprocess runs without corrections (it has nothing to copy) and
 # the corrections are applied after the launch, as in non-align async mode. Other steps keep the synchronous path.
-# EXL3_ALIGN_NOSYNC=1 enables it.
-_ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
+# EXL3_ALIGN_NOSYNC=1 enables it (unset: on while the EXL3 plugin serves the model, vllm/v1/llmt_defaults.py).
+_ALIGN_NOSYNC = _llmt.flag(__name__, "_ALIGN_NOSYNC", "EXL3_ALIGN_NOSYNC", "1", "0", lambda v: v == "1")
 # ALIGN-NOSYNC2: also skip the accepted-count wait when requests were added / finished / reordered, as long as every
 # CONTINUING speculative request stays inside its mamba block (same margin as ALIGN-NOSYNC). preprocess_mamba reads a
 # CPU count only for a request whose state block changes; continuing ones can't (margin) and new / non-speculative
@@ -287,7 +290,7 @@ _ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
 _ALIGN_NOSYNC2 = os.environ.get("EXL3_ALIGN_NOSYNC2", "1") == "1"
 _RC_PINNED = os.environ.get("EXL3_RC_PINNED", "1") == "1"  # RC-PINNED (see _llmt_gdn_rc; only with GDN recompute)
 # SPEC-STOP: drop speculative tokens sampled AFTER a stop token on the GPU (see _llmt_stop_truncate)
-_SPEC_STOP = os.environ.get("EXL3_SPEC_STOP_TRUNC", "0") == "1"
+_SPEC_STOP = _llmt.flag(__name__, "_SPEC_STOP", "EXL3_SPEC_STOP_TRUNC", "1", "0", lambda v: v == "1")
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -532,6 +535,7 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        _llmt.activate(vllm_config)   # EXL3_* defaults (vllm/v1/llmt_defaults.py)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config

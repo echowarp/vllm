@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import os
+from vllm.v1 import llmt_defaults as _llmt
 
 import torch
 
@@ -57,7 +58,7 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 # Parallel softmax segments for the 3D kernel. 32 instead of 16: one 20k-token sequence on an RTX 5090 drops from
 # 177 to 138 us per layer. Override with EXL3_ATTN_SEGMENTS.
-NUM_PAR_SOFTMAX_SEGMENTS = int(os.environ.get("EXL3_ATTN_SEGMENTS", "32"))
+NUM_PAR_SOFTMAX_SEGMENTS = _llmt.flag(__name__, "NUM_PAR_SOFTMAX_SEGMENTS", "EXL3_ATTN_SEGMENTS", "64", "32", int)
 # Spec-decode verify steps use the 3D kernel too (see unified_attention), so the segment buffers hold up to
 # EXL3_ATTN_3D_MAXQ query rows (k + 1) per sequence.
 _ATTN_3D_ROWS = int(os.environ.get("EXL3_ATTN_3D_MAXQ", "8"))

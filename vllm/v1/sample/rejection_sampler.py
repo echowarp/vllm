@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import os
+from vllm.v1 import llmt_defaults as _llmt
 
 from collections.abc import Sequence
 from dataclasses import replace
@@ -39,7 +40,7 @@ MAX_SPEC_LEN = 128
 # multi-CTA softmax -> top_k_renorm_probs -> top_p_renorm_probs gives the same target distribution (same kept sets,
 # |dprob| <= 2e-7 in tests) in ~156 us. The target logits then stay unmasked: only target_probs carry the constraint,
 # so it is used only when the caller does not return processed logprobs. EXL3_FI_TOPKP=1 enables.
-_EXL3_FI_TOPKP = os.environ.get("EXL3_FI_TOPKP", "0") == "1"
+_EXL3_FI_TOPKP = _llmt.flag(__name__, "_EXL3_FI_TOPKP", "EXL3_FI_TOPKP", "1", "0", lambda v: v == "1")
 _EXL3_FI_STASH: list = [None]
 
 
