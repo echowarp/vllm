@@ -61,6 +61,27 @@ dict lookup. The XPU model runner and worker inherit these methods, so the same 
 for another use sets it, and `get_usage()`, the scheduler's length-cap wait and the tail-hold watermark leave those
 blocks out.
 
+## EXL3_* switch defaults (`vllm/v1/llmt_defaults.py`)
+
+The branch's engine features are switched by `EXL3_*` variables. A variable that is set (also to an empty string)
+always wins. An unset one takes the reference build's value **only while the EXL3 plugin serves the model**: the
+model's quantization is `exl3` (a method that only exl3xpu registers) and the GPU is an Intel XPU. Every other model, and
+this branch without the plugin, keeps upstream behaviour. `activate(vllm_config)` decides once per process (first
+thing in `Scheduler.__init__` and `GPUModelRunner.__init__`); module constants made with `flag()` are re-evaluated
+then, `env()` reads the decision on every call.
+
+| Variable | Upstream (inactive) | While the plugin serves an EXL3 model |
+|---|---|---|
+| `EXL3_ALIGN_NOSYNC` | 0 | 1 |
+| `EXL3_SPEC_STOP_TRUNC` | 0 | 1 |
+| `EXL3_TAIL_HOLD` | 0 | 1 (inert until the runner confirms GDN recompute) |
+| `EXL3_EAGLE_KEEP` | 0 | 2 (core and offloading-connector scheduler) |
+| `EXL3_SCHED_MIXED_K` | -1 | 4 |
+| `EXL3_ENCODER_CACHE_TOKENS` | 0 | 16384 |
+| `EXL3_GPU_EVICT_ORDER` | (vLLM order) | chain |
+| `EXL3_GDN_RECOMPUTE` | off | follows the plugin's `GDN_RC["on"]` (on by default for EXL3 models; the plugin clears it when its half cannot install). `EXL3_GDN_RECOMPUTE=1` forces it for any model |
+| `EXL3_RC_PINNED` | 1 | 1 (only used with GDN recompute) |
+
 ## Tests (CPU, no GPU needed)
 
 ```bash
