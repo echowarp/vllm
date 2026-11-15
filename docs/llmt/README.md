@@ -65,7 +65,8 @@ blocks out.
 
 ```bash
 TRITON_INTERPRET=1 VLLM_KV_CACHE_LAYOUT=NHD pytest -q --noconftest \
-    tests/v1/core/test_extension_hooks.py tests/v1/worker/test_packed_kv_hybrid.py
+    tests/v1/core/test_extension_hooks.py tests/v1/worker/test_packed_kv_hybrid.py \
+    tests/v1/worker/test_llmt_gdn_rc_switch.py
 ```
 
 `test_extension_hooks.py`: registry semantics, the decorators, block-pool placement override and lent-block usage,
