@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from vllm.v1.llmt_defaults import env as _llmt_env
 # EXL3_EAGLE_KEEP=2: the core scheduler keeps the full
 # prefix hit despite the MTP/EAGLE last-block rule; the RAM-tier lookup must not pop the EAGLE group's trailing chunk
 # either (it lost one chunk per RAM hit, and with --prefix-match-unit 64 + STATE_STORE=prompt_end every state lookup).
-_LLMT_EAGLE_KEEP2 = os.environ.get("EXL3_EAGLE_KEEP", "0") == "2"
+_LLMT_EAGLE_KEEP2 = _llmt_env("EXL3_EAGLE_KEEP", "2", "0") == "2"   # same default as the core scheduler
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field

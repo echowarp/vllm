@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.v1.llmt_defaults import env as _llmt_env
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -88,7 +89,7 @@ _MIXED_PROPOSE = os.environ.get("EXL3_SCHED_MIXED_PROPOSE", "")
 # EXL3_EAGLE_KEEP=2: always keep the full hit, no tracking. A missing drafter entry is then zeros (KV allocated with
 # torch.zeros, int8 scales filled with 1.0) or stale finite data from an earlier owner: at most one slightly wrong
 # position in the drafter's context; drafts only.
-_EAGLE_KEEP_MODE = os.environ.get("EXL3_EAGLE_KEEP", "0")
+_EAGLE_KEEP_MODE = _llmt_env("EXL3_EAGLE_KEEP", "2", "0")   # unset: 2 on an XPU (vllm/v1/llmt_defaults.py)
 _EAGLE_KEEP = _EAGLE_KEEP_MODE in ("1", "2")
 _EK_DONE: dict = {}          # draft-group physical block_id -> block_hash at completion
 _EK_STAT = {"hits": 0, "kept": 0, "fallback": 0, "saved_tokens": 0}
@@ -337,7 +338,7 @@ class Scheduler(SchedulerInterface):
         # (compute-bound), schedule only the first k draft tokens of each decoding request: draft rows
         # cost real compute there (about one prefill token each) but yield only their acceptance
         # probability.
-        self.mixed_k = int(os.environ.get("EXL3_SCHED_MIXED_K", "-1"))
+        self.mixed_k = int(_llmt_env("EXL3_SCHED_MIXED_K", "4", "-1"))   # unset: 4 on an XPU
         self._llmt_chunk_cap = 0
 
         # Encoder-related.
@@ -365,7 +366,7 @@ class Scheduler(SchedulerInterface):
         # EXL3_ENCODER_CACHE_TOKENS=N: an encoder cache of its own size, independent of
         # max_num_batched_tokens (vLLM sizes it = max_num_batched_tokens, so a multi-image prompt could
         # hold the cache with its own earlier image; see ENC-CUT-GUARD in _mamba_block_aligned_split).
-        _ecs = int(os.environ.get("EXL3_ENCODER_CACHE_TOKENS", "0") or 0)
+        _ecs = int(_llmt_env("EXL3_ENCODER_CACHE_TOKENS", "16384", "0") or 0)   # unset: 16384 on an XPU
         if mm_budget and _ecs > encoder_cache_size:
             logger.info("Encoder cache %d -> %d tokens (EXL3_ENCODER_CACHE_TOKENS)", encoder_cache_size, _ecs)
             encoder_cache_size = _ecs
@@ -3370,7 +3371,7 @@ class Scheduler(SchedulerInterface):
 # hold while a preempted request waits. Inert unless EXL3_TAIL_HOLD=1 (and the runner in this process confirmed).
 # Requires the GDN recompute path in the model runner (EXL3_GDN_RECOMPUTE=1, EXL3 runtime plugin) and
 # mamba_cache_mode="align".
-_TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"
+_TAIL_HOLD = _llmt_env("EXL3_TAIL_HOLD", "1", "0") == "1"   # unset: on with an XPU
 _TH_TOOL_IDS = {int(x) for x in os.environ.get("EXL3_TAIL_HOLD_TOOL_IDS", "").split(",") if x.strip()}
 _TH_LOG = os.environ.get("EXL3_TAIL_HOLD_LOG", "0") == "1"     # one line per hold / hit (tests)
 # shared with the model runner (same process): runner_ok, flushed {rid: bool}, zero_next [(group_id, block_id)]

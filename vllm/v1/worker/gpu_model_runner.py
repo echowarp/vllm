@@ -251,6 +251,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+from vllm.v1.llmt_defaults import env as _llmt_env
 
 _QWEN3_NEXT_PLAIN_MROPE = "_qwen3_next_plain_mrope"
 
@@ -285,8 +286,21 @@ def _is_qwen3_next_plain_mrope_eligible(
     )
 
 _MAMBA_ACC_FIX = os.environ.get("EXL3_MAMBA_ACC_FIX", "1") == "1"  # MAMBA-ACC (see execute_model)
-_GDN_RC_ON = os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1"  # GDN-RECOMPUTE (see _llmt_gdn_rc)
-_TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llmt_tail_hold)
+
+
+@functools.lru_cache(maxsize=1)
+def _gdn_rc_on() -> bool:
+    """GDN-RECOMPUTE (see _llmt_gdn_rc) runs when the EXL3 plugin's half is installed: exl3xpu.vllm_plugin.GDN_RC["on"]
+    = EXL3_GDN_RECOMPUTE (unset: on), cleared by the plugin when its half cannot install. Without the plugin it is
+    off. Both halves read one switch, so they cannot disagree. First called after plugin registration, then cached."""
+    try:
+        from exl3xpu.vllm_plugin import GDN_RC
+        return bool(GDN_RC.get("on"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_TAIL_HOLD = _llmt_env("EXL3_TAIL_HOLD", "1", "0") == "1"  # TAIL-HOLD (see _llmt_tail_hold; vllm/v1/llmt_defaults.py)
 # ALIGN-NOSYNC: with mamba_cache_mode="align" + async scheduling + spec decode, vLLM waits every step for the previous
 # step's accepted-token counts on the CPU (num_accepted_tokens_event) and applies the deferred spec corrections
 # (another wait) before preprocess_mamba, so the CPU prepares step n+1 only after step n has finished and the GPU idles
@@ -295,11 +309,11 @@ _TAIL_HOLD = os.environ.get("EXL3_TAIL_HOLD", "0") == "1"  # TAIL-HOLD (see _llm
 # speculative both steps, every request >= 3*(k+1) tokens away from a mamba block boundary) the counts are taken on
 # the GPU (copy of the postprocess output) instead, preprocess runs without corrections (it has nothing to copy) and
 # the corrections are applied after the launch, as in non-align async mode. Other steps keep the synchronous path.
-# EXL3_ALIGN_NOSYNC=1 enables it.
-_ALIGN_NOSYNC = os.environ.get("EXL3_ALIGN_NOSYNC", "0") == "1"
-_RC_PINNED = os.environ.get("EXL3_RC_PINNED", "0") == "1"  # RC-PINNED (see _llmt_gdn_rc)
+# EXL3_ALIGN_NOSYNC=1 enables it (unset: on with an XPU, vllm/v1/llmt_defaults.py).
+_ALIGN_NOSYNC = _llmt_env("EXL3_ALIGN_NOSYNC", "1", "0") == "1"
+_RC_PINNED = os.environ.get("EXL3_RC_PINNED", "1") == "1"  # RC-PINNED (see _llmt_gdn_rc; only with GDN recompute)
 # SPEC-STOP: drop speculative tokens sampled AFTER a stop token on the GPU (see _llmt_stop_truncate)
-_SPEC_STOP = os.environ.get("EXL3_SPEC_STOP_TRUNC", "0") == "1"
+_SPEC_STOP = _llmt_env("EXL3_SPEC_STOP_TRUNC", "1", "0") == "1"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4440,7 +4454,7 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
-                if _GDN_RC_ON:
+                if _gdn_rc_on():
                     try:
                         self._llmt_gdn_rc(scheduler_output, mamba_bufs.preprocess)
                         if _quiet:   # pending count = last step's accepted count, from the GPU (CPU copy not waited for)
@@ -7932,7 +7946,7 @@ class GPUModelRunner(
         from vllm.v1.core.sched import scheduler as _sm
         sh = _sm._TH_SHARED
         if not sh["runner_ok"]:
-            if _GDN_RC_ON and self.cache_config.mamba_cache_mode == "align":
+            if _gdn_rc_on() and self.cache_config.mamba_cache_mode == "align":
                 sh["runner_ok"] = True
                 logger.info("TAIL-HOLD: runner ready (GDN recompute, align mode)")
                 try:   # tool-call end token ids for ranking holds (scheduler _TailHold.score)
@@ -8183,7 +8197,7 @@ class GPUModelRunner(
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        if _GDN_RC_ON and not is_profiling:   # GDN-RECOMPUTE: buffers must exist before graph capture
+        if _gdn_rc_on() and not is_profiling:   # GDN-RECOMPUTE: buffers must exist before graph capture
             try:
                 from exl3xpu.vllm_plugin import GDN_RC
                 gids = [i for i, g in enumerate(kv_cache_config.kv_cache_groups) if isinstance(g.kv_cache_spec, MambaSpec)]
