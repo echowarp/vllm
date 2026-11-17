@@ -1,3 +1,52 @@
+# echowarp/vllm `publish-20261113-cuda`: vLLM 0.26 for Qwen3.8-27B agent serving on an RTX 5090
+
+This fork is vLLM v0.26.0 plus small, one-feature-per-commit changes (scheduler, speculative decoding, prefix cache and
+KV offload for hybrid attention + GDN models) and named extension hooks for a memory-management plugin. Fork
+documentation: [docs/llmt/README.md](docs/llmt/README.md) (every commit, the hooks, the `EXL3_*` switches, CPU tests);
+release notes: [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md).
+
+## What this fork adds
+
+| Feature | What it does | Measured effect |
+|---|---|---|
+| Prefix-cache tail hold | keeps a finished request's partial last block and its GDN state at the exact token, so the next agent turn (a tool result) continues where the last one stopped | real RTX 5090 agent traffic: 232 tail hits reused 635,441 tokens beyond the block-rounded prefix hit, median 2,085 per hit (1) |
+| Packed (cross-layer) KV for hybrid models | one KV allocation, one contiguous row per block across all layers, for attention + Mamba/GDN models | RTX 5090 KV cache 436,585 -> 482,846 tokens (+10.6 %), together with AllBroker's lazy vision tower and vision-tower lending (2) |
+| KV offload for hybrid models | CPU-tier offload that works with GDN state and MTP; per-slot pinning for a broker-managed shared pool; paced copies; NaN/inf scan of stored blocks | the host-RAM tier served 2.6 % of prompt tokens on real RTX 5090 agent traffic, next to 59.7 % from the GPU prefix cache (1) |
+| MTP speculative decoding | full prefix hit kept with MTP drafters, draft depth keyed on decoding requests, stop-token truncation on the GPU, fused draft sampling, FlashInfer top-k/top-p, faster GQA verify attention | not measured per commit; see the whole-stack numbers below |
+| Scheduler liveness | no stall on blocks held by waiting requests, length-capped finish, liveness guard, recompute instead of abort on NaN/inf logits | correctness, no speed claim |
+| Extension hooks | 15 named hooks (scheduler, block pool, model runner, worker) instead of runtime method patching; lent blocks left out of KV usage | log-probs vs the production engine: 5/6 prompts identical, max abs difference 0.070, inside the 0.091 between two production starts (3) |
+| `EXL3_*` switch defaults | the reference build's values apply only while the EXL3 plugin serves an EXL3 model on sm_120 | every other model keeps upstream behaviour |
+
+Whole stack (this branch + exl3cuda kernels + AllBroker, RTX 5090, shipped defaults): 1,262.5 tok/s aggregate at 16
+concurrent requests (vLLM 0.28: 546.6; SparkInfer v0.5.5: 345.1) and 337.6 tok/s single stream, overall harmonic mean
+(SparkInfer + DSpark v2: 264.8) (4).
+
+Sources: (1) AllRunner [benchmarks/charts/data/ours.json](https://github.com/echowarp/AllRunner/blob/main/benchmarks/charts/data/ours.json),
+block `cache_production_5090`; (2) AllRunner chart [on-demand](https://github.com/echowarp/AllRunner/blob/main/benchmarks/charts/out/on-demand.png) and [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md); (3) [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md);
+(4) AllRunner [benchmarks/README.md](https://github.com/echowarp/AllRunner/blob/main/benchmarks/README.md).
+
+## Which branch
+
+- `publish-20261113-cuda` (this branch): NVIDIA, tested on the RTX 5090 (sm_120).
+- `publish-20261113-xpu`: Intel Arc Pro B70; Intel's llm-scaler XPU patch is its first commit.
+- `main` is upstream vLLM, unchanged.
+
+## How it fits
+
+[AllRunner](https://github.com/echowarp/AllRunner) builds one image per GPU from this branch, the GPU's kernel plugin
+([echowarp/exllamav3](https://github.com/echowarp/exllamav3) `exl3cuda` here) and AllBroker's `llmt_kv`, pinned by
+commit, and runs the router, launchers and benchmarks. [AllBroker](https://github.com/echowarp/AllBroker) is the memory
+layer (host-RAM KV tier, weight keeper, KV lending); its plugin works with stock vLLM 0.26 and uses this branch's
+extension hooks when they are there.
+
+## License
+
+Apache-2.0, as upstream ([LICENSE](LICENSE)). Upstream's README follows unchanged.
+
+---
+
+## Upstream README
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
