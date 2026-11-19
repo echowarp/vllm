@@ -9,6 +9,8 @@ hooks for a memory-management plugin) and three XPU-only commits. With the
 upstream exl3xpu's own benchmark: aggregate decode 125.0 tok/s at 1 stream and 530.2 at 16 (prose; upstream exl3xpu
 91.2 and 365), cold prefill of a 32K-token prompt 2,823 tok/s (upstream 2,124).
 
+![Arc B70: ours vs upstream exl3xpu, aggregate decode at 1-16 streams](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/arc-upstream-panel.png)
+
 This branch (`xpu`) is the Intel build; the NVIDIA build is the repository's
 [default branch](https://github.com/echowarp/vllm).
 
