@@ -31,10 +31,21 @@ block `cache_production_5090`; (2) AllRunner chart [on-demand](https://github.co
 and [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md); (3) [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md); whole-stack
 numbers: AllRunner [benchmarks/README.md](https://github.com/echowarp/AllRunner/blob/main/benchmarks/README.md).
 
+MTP speculative decoding, whole stack, single stream per workload (SparkInfer's harness shape: 256 tokens, greedy,
+thinking off; shipped defaults, median of 3 reps):
+
+![RTX 5090, single stream by workload](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/5090-single-stream.png)
+
 
 The tail hold and the RAM tier together: what an agent's next turn has to prefill.
 
 ![Prefill only what's new](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/tail-reuse.png)
+
+Agent task time: 340 multi-agent production tasks replayed on each engine (modeled: decode from each engine's measured
+or published throughput curve, prefill from its cache rules; the model gives 1.2 min for our RTX 5090 where the trace
+measured 2.0 min):
+
+![Multi-agent task time](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/task-time.png)
 
 ## Use it
 
