@@ -1,160 +1,77 @@
-# echowarp/vllm `publish-20261113-xpu`: vLLM 0.26 for Qwen3.8-27B agent serving on an Intel Arc Pro B70
+# vllm (Intel Arc Pro B70 build)
 
-This fork is vLLM v0.26.0 with Intel's llm-scaler XPU patch as its first commit, plus small, one-feature-per-commit
-changes (scheduler, speculative decoding, prefix cache and KV offload for hybrid attention + GDN models), three
-XPU-only commits and named extension hooks for a memory-management plugin. Fork documentation:
-[docs/llmt/README.md](docs/llmt/README.md) (every commit, the hooks, the `EXL3_*` switches, CPU tests); release notes:
-[docs/llmt/RELEASE.md](docs/llmt/RELEASE.md).
+A fork of [vLLM](https://github.com/vllm-project/vllm) v0.26.0 for serving Qwen3.8-27B (EXL3 4.0 bpw, a hybrid
+attention + GDN model) to several tool-calling agents at once on one Intel Arc Pro B70. Its first commit is Intel's
+[llm-scaler](https://github.com/intel/llm-scaler) XPU patch for vLLM 0.26.0; on top come the same one-feature-per-commit
+changes as the NVIDIA build (scheduler, speculative decoding, prefix cache and KV offload for hybrid models, extension
+hooks for a memory-management plugin) and three XPU-only commits. With the
+[exl3xpu](https://github.com/echowarp/exl3xpu) kernels and [AllBroker](https://github.com/echowarp/AllBroker), on
+upstream exl3xpu's own benchmark: aggregate decode 125.0 tok/s at 1 stream and 530.2 at 16 (prose; upstream exl3xpu
+91.2 and 365), cold prefill of a 32K-token prompt 2,823 tok/s (upstream 2,124).
 
-## What this fork adds
+This branch (`xpu`) is the Intel build; the NVIDIA build is the repository's
+[default branch](https://github.com/echowarp/vllm).
 
-| Feature | What it does | Measured effect |
+## What's different from upstream
+
+Every commit and hook, the `EXL3_*` switch defaults and the CPU tests: [docs/llmt/README.md](docs/llmt/README.md).
+Release notes and validation: [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md).
+
+| Change | What it does | Measured effect |
 |---|---|---|
-| Prefix-cache tail hold | keeps a finished request's partial last block and its GDN state at the exact token, so the next agent turn (a tool result) continues where the last one stopped | same commit as the CUDA branch; on real RTX 5090 agent traffic 232 tail hits reused 635,441 tokens beyond the block-rounded prefix hit, median 2,085 per hit (1) |
-| Packed (cross-layer) KV for hybrid models | one KV allocation, one contiguous row per block across all layers, for attention + Mamba/GDN models | measured on the RTX 5090 (see `publish-20261113-cuda`); not measured separately on the Arc |
+| Prefix-cache tail hold | keeps a finished request's partial last block and its GDN state at the exact token, so the next agent turn (a tool result) continues where the last one stopped | same commit as the NVIDIA build; on real RTX 5090 agent traffic 232 tail hits reused 635,441 tokens beyond the block-rounded prefix hit, median 2,085 per hit (1) |
+| Packed (cross-layer) KV for hybrid models | one KV allocation, one contiguous row per block across all layers, for attention + Mamba/GDN models | measured on the RTX 5090 (NVIDIA build); not measured separately on the Arc |
 | KV offload for hybrid models | CPU-tier offload that works with GDN state and MTP; paced copies through a pinned staging ring (XPU only); NaN/inf scan of stored blocks | the host-RAM tier served 2.6 % of prompt tokens on real RTX 5090 agent traffic (1); not measured separately on the Arc |
-| MTP speculative decoding | full prefix hit kept with MTP drafters, draft depth keyed on decoding requests, stop-token truncation on the GPU, fused draft sampling, fused top-k/top-p mask from exl3xpu (XPU only) | not measured per commit; see the whole-stack numbers below |
+| MTP speculative decoding | full prefix hit kept with MTP drafters, draft depth keyed on decoding requests, stop-token truncation on the GPU, fused draft sampling, fused top-k/top-p mask from exl3xpu (XPU only) | not measured per commit; see the whole-stack numbers above |
+| Host work off the critical path | the CPU prepares step n+1 while the GPU runs step n: no wait for the accepted-token counts on spec-decode steps in Mamba align mode (also on steps that add, finish or reorder requests); GDN recompute metadata through a ring of pinned buffers instead of synchronous pageable copies; stop-token truncation and draft sampling on the GPU | each of the two sync removals took out ~2.6 ms of GPU idle per decode step (of 18.4 ms) on an RTX 5090 |
 | Scheduler liveness | no stall on blocks held by waiting requests, length-capped finish, liveness guard, recompute instead of abort on NaN/inf logits | correctness, no speed claim |
 | Extension hooks | 15 named hooks (scheduler, block pool, model runner, worker) instead of runtime method patching; lent blocks left out of KV usage | Arc B70 with AllBroker's lend manager: KV 497,302 tokens, LoRA decode 179.9 tok/s (1 stream); log-probs 6/6 prompts identical vs the same engine with the pre-publish plugin (2) |
 | `EXL3_*` switch defaults | the reference build's values apply only while the exl3xpu plugin serves an EXL3 model | every other model keeps upstream behaviour |
 
-Whole stack (this branch + exl3xpu kernels + AllBroker, Arc Pro B70), on upstream exl3xpu's own benchmark
-(`bench/sweep.py --corpus real`): aggregate decode 125.0 tok/s at 1 stream and 530.2 at 16 (prose; upstream exl3xpu
-91.2 and 365), cold prefill of a 32K-token prompt 2,823 tok/s (upstream 2,124) (3).
-
 Sources: (1) AllRunner [benchmarks/charts/data/ours.json](https://github.com/echowarp/AllRunner/blob/main/benchmarks/charts/data/ours.json),
-block `cache_production_5090`; (2) [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md); (3) AllRunner
+block `cache_production_5090`; (2) [docs/llmt/RELEASE.md](docs/llmt/RELEASE.md); whole-stack numbers: AllRunner
 [benchmarks/README.md](https://github.com/echowarp/AllRunner/blob/main/benchmarks/README.md).
 
-## Which branch
 
-- `publish-20261113-xpu` (this branch): Intel Arc Pro B70 (XPU).
-- `publish-20261113-cuda`: NVIDIA, tested on the RTX 5090 (sm_120).
-- `main` is upstream vLLM, unchanged.
+The tail hold and the RAM tier together: what an agent's next turn has to prefill.
 
-## How it fits
+![Prefill only what's new](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/tail-reuse.png)
 
-[AllRunner](https://github.com/echowarp/AllRunner) builds one image per GPU from this branch, the GPU's kernel plugin
-([echowarp/exl3xpu](https://github.com/echowarp/exl3xpu) here) and AllBroker's `llmt_kv`, pinned by commit, and runs
-the router, launchers and benchmarks. [AllBroker](https://github.com/echowarp/AllBroker) is the memory layer
-(host-RAM KV tier, weight keeper, KV lending); its plugin works with stock vLLM 0.26 and uses this branch's extension
-hooks when they are there.
+## Use it
+
+The commits after Intel's patch change Python files only. [AllRunner](https://github.com/echowarp/AllRunner)'s Arc
+image starts from an `intel/llm-scaler-vllm:0.26.0-b2`-based image and copies this branch's changed files over Intel's
+installed vLLM ([docker/overlay_vllm.sh](https://github.com/echowarp/AllRunner/blob/main/docker/overlay_vllm.sh)
+checks that every file it replaces equals the Intel files the branch was made from), then adds exl3xpu and
+AllBroker's `llmt_kv`:
+
+```sh
+git clone https://github.com/echowarp/AllRunner && cd AllRunner
+docker build -f docker/Dockerfile.arc -t allrunner-arc .
+launchers/arc-b70.sh        # engine on 127.0.0.1:8000
+```
+
+Launcher settings, start order and the router in front: AllRunner
+[launchers/README.md](https://github.com/echowarp/AllRunner/blob/main/launchers/README.md). A full source build of
+this tree is not what we test.
+
+## Requires / works with
+
+- [echowarp/exl3xpu](https://github.com/echowarp/exl3xpu): the ESIMD kernels and vLLM plugin for the Arc Pro B70.
+- [echowarp/AllBroker](https://github.com/echowarp/AllBroker): the memory layer (host-RAM KV tier, weight keeper, KV
+  lending). Its plugin works with stock vLLM 0.26 and uses this fork's extension hooks when they are there.
+- [echowarp/AllRunner](https://github.com/echowarp/AllRunner): images, launchers, router and benchmarks.
+- [echowarp/b70-linux](https://github.com/echowarp/b70-linux): optional host patches and tools for the Arc Pro B70.
+- RTX 5090: the [default branch](https://github.com/echowarp/vllm) with
+  [echowarp/exllamav3](https://github.com/echowarp/exllamav3) (`exl3cuda`).
+
+## Upstream
+
+vLLM is by the vLLM project: [vllm-project/vllm](https://github.com/vllm-project/vllm). This fork is based on tag
+v0.26.0 plus Intel's [llm-scaler](https://github.com/intel/llm-scaler) `vllm-0.26.0-b2` patch (the first commit, written by
+Intel and imported unchanged). For everything else (other models and hardware, installation, documentation) see upstream's
+[README](https://github.com/vllm-project/vllm/blob/v0.26.0/README.md) and [docs.vllm.ai](https://docs.vllm.ai).
 
 ## License
 
-Apache-2.0, as upstream ([LICENSE](LICENSE)). Upstream's README follows unchanged.
-
----
-
-## Upstream README
-
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
-
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
-
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
-
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
-
----
-
-## About
-
-vLLM is a fast and easy-to-use library for LLM inference and serving.
-
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
-
-```bash
-uv pip install vllm
-```
-
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+Apache-2.0, as upstream ([LICENSE](LICENSE)); Intel's patch is Apache-2.0 as well.
